@@ -1,8 +1,10 @@
 import os
 import time
+import json
 from typing import Any
 
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from internal_agent.agent.loop import Agent
@@ -16,6 +18,7 @@ from internal_agent.llm.azure_web_adapter import AzureWebLLM
 
 
 app = FastAPI()
+
 
 def _env_bool(name: str, default: bool = False) -> bool:
     value = os.getenv(name)
@@ -38,12 +41,12 @@ def _env_optional_int(name: str) -> int | None:
     return int(value)
 
 
-def create_agent_from_env() -> Agent:
-    llm = AzureWebLLM(
+def create_llm_from_env(session_key: str) -> AzureWebLLM:
+    return AzureWebLLM(
         token_cache=os.getenv("KINGOGPT_TOKEN_CACHE", str(DEFAULT_TOKEN_CACHE)),
         token_config=os.getenv("KINGOGPT_TOKEN_CONFIG", str(DEFAULT_TOKEN_CONFIG)),
         profile_dir=os.getenv("KINGOGPT_PROFILE_DIR", str(DEFAULT_PROFILE_DIR)),
-        session_key=os.getenv("INTERNAL_AGENT_SESSION_KEY", "internal_agent_api"),
+        session_key=session_key,
         chat_room_id=_env_optional_int("KINGOGPT_CHAT_ROOM_ID"),
         scenario_id=os.getenv("KINGOGPT_SCENARIO_ID") or None,
         request_timeout=_env_int("KINGOGPT_REQUEST_TIMEOUT", 120),
@@ -54,25 +57,41 @@ def create_agent_from_env() -> Agent:
         auto_delete_thread=_env_bool("KINGOGPT_AUTO_DELETE_THREAD", True),
         echo=_env_bool("KINGOGPT_ECHO_LLM"),
     )
-    return Agent(llm, max_steps=_env_int("INTERNAL_AGENT_MAX_STEPS", DEFAULT_MAX_STEPS))
 
 
-_agent = create_agent_from_env()
+_raw_llm = create_llm_from_env("kingogpt_raw_model")
+_agent = Agent(
+    create_llm_from_env("kingogpt_agent"),
+    max_steps=_env_int("INTERNAL_AGENT_MAX_STEPS", DEFAULT_MAX_STEPS),
+)
 
 
 class ChatCompletionRequest(BaseModel):
-    model: str = "internal-azure-web-agent"
+    model: str = "kingogpt-web"
     messages: list[dict[str, Any]]
     stream: bool = False
-
-
-def get_agent() -> Agent:
-    return _agent
+    temperature: float | None = None
+    max_tokens: int | None = None
 
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "internal-azure-web-agent"}
+    return {"status": "ok", "service": "kingogpt-openai-compatible"}
+
+
+@app.get("/v1/models")
+def list_models():
+    return {
+        "object": "list",
+        "data": [
+            {
+                "id": "kingogpt-web",
+                "object": "model",
+                "created": int(time.time()),
+                "owned_by": "kingogpt",
+            }
+        ],
+    }
 
 
 def _content_to_text(content: Any) -> str:
@@ -91,16 +110,129 @@ def _content_to_text(content: Any) -> str:
     return "" if content is None else str(content)
 
 
+def messages_to_prompt(messages: list[dict[str, Any]]) -> str:
+    blocks: list[str] = []
+
+    for message in messages:
+        role = message.get("role", "user")
+        content = _content_to_text(message.get("content"))
+        if content.strip():
+            blocks.append(f"{role.upper()}:\n{content}")
+
+    blocks.append("ASSISTANT:")
+    return "\n\n".join(blocks)
+
+
+def make_completion_response(model: str, content: str) -> dict[str, Any]:
+    return {
+        "id": "chatcmpl-kingogpt",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": content,
+                },
+                "finish_reason": "stop",
+            }
+        ],
+    }
+
+
+def sse_event(data: dict[str, Any]) -> str:
+    return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+
 @app.post("/v1/chat/completions")
-def chat_completions(req: ChatCompletionRequest):
-    user_messages = [
-        _content_to_text(message.get("content"))
-        for message in req.messages
-        if message.get("role") == "user"
-    ]
-    task = user_messages[-1] if user_messages else ""
+def raw_chat_completions(req: ChatCompletionRequest):
+    """
+    Raw OpenAI-compatible model endpoint. Hermes should use this endpoint.
+    """
+    prompt = messages_to_prompt(req.messages)
+
+    if req.stream:
+        def generate():
+            try:
+                answer = _raw_llm.complete(prompt)
+
+                yield sse_event(
+                    {
+                        "id": "chatcmpl-kingogpt",
+                        "object": "chat.completion.chunk",
+                        "created": int(time.time()),
+                        "model": req.model,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {
+                                    "role": "assistant",
+                                    "content": answer,
+                                },
+                                "finish_reason": None,
+                            }
+                        ],
+                    }
+                )
+
+                yield sse_event(
+                    {
+                        "id": "chatcmpl-kingogpt",
+                        "object": "chat.completion.chunk",
+                        "created": int(time.time()),
+                        "model": req.model,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {},
+                                "finish_reason": "stop",
+                            }
+                        ],
+                    }
+                )
+
+                yield "data: [DONE]\n\n"
+            except Exception as exc:
+                yield sse_event(
+                    {
+                        "error": {
+                            "message": str(exc),
+                            "type": "kingogpt_backend_error",
+                        }
+                    }
+                )
+                yield "data: [DONE]\n\n"
+
+        return StreamingResponse(generate(), media_type="text/event-stream")
+
     try:
-        answer = get_agent().run(task)
+        answer = _raw_llm.complete(prompt)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "error": {
+                    "message": str(exc),
+                    "type": "kingogpt_backend_error",
+                }
+            },
+        ) from exc
+
+    return make_completion_response(req.model, answer)
+
+
+@app.post("/v1/agent/chat/completions")
+def agent_chat_completions(req: ChatCompletionRequest):
+    """
+    Existing custom JSON-action agent endpoint.
+    Keep this for standalone testing, not for Hermes.
+    """
+    task = messages_to_prompt(req.messages)
+
+    try:
+        answer = _agent.run(task)
     except Exception as exc:
         raise HTTPException(
             status_code=502,
@@ -112,19 +244,4 @@ def chat_completions(req: ChatCompletionRequest):
             },
         ) from exc
 
-    return {
-        "id": "chatcmpl-internal-agent",
-        "object": "chat.completion",
-        "created": int(time.time()),
-        "model": req.model,
-        "choices": [
-            {
-                "index": 0,
-                "message": {
-                    "role": "assistant",
-                    "content": answer,
-                },
-                "finish_reason": "stop",
-            }
-        ],
-    }
+    return make_completion_response(req.model, answer)

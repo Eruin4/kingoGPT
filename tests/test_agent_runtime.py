@@ -89,7 +89,48 @@ class AgentLoopTests(unittest.TestCase):
 
 
 class OpenAICompatTests(unittest.TestCase):
-    def test_chat_completion_endpoint_with_mock_agent(self):
+    def test_raw_chat_completion_endpoint_with_mock_llm(self):
+        try:
+            from fastapi.testclient import TestClient
+        except Exception as exc:
+            self.skipTest(f"FastAPI TestClient unavailable: {exc}")
+
+        import internal_agent.server.openai_compat as compat
+
+        class FakeLLM:
+            def __init__(self):
+                self.prompt = None
+
+            def complete(self, prompt):
+                self.prompt = prompt
+                return "api ok"
+
+        fake_llm = FakeLLM()
+        original_llm = compat._raw_llm
+        compat._raw_llm = fake_llm
+        try:
+            client = TestClient(compat.app)
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "kingogpt-web",
+                    "messages": [
+                        {"role": "system", "content": "be brief"},
+                        {"role": "user", "content": "hello"},
+                    ],
+                },
+            )
+            self.assertEqual(response.status_code, 200)
+            payload = response.json()
+            self.assertEqual(payload["choices"][0]["message"]["content"], "api ok")
+            self.assertEqual(
+                fake_llm.prompt,
+                "SYSTEM:\nbe brief\n\nUSER:\nhello\n\nASSISTANT:",
+            )
+        finally:
+            compat._raw_llm = original_llm
+
+    def test_agent_chat_completion_endpoint_with_mock_agent(self):
         try:
             from fastapi.testclient import TestClient
         except Exception as exc:
@@ -103,7 +144,7 @@ class OpenAICompatTests(unittest.TestCase):
 
             def run(self, task):
                 self.task = task
-                return "api ok"
+                return "agent ok"
 
         fake_agent = FakeAgent()
         original_agent = compat._agent
@@ -111,18 +152,67 @@ class OpenAICompatTests(unittest.TestCase):
         try:
             client = TestClient(compat.app)
             response = client.post(
-                "/v1/chat/completions",
+                "/v1/agent/chat/completions",
                 json={
-                    "model": "internal-azure-web-agent",
+                    "model": "kingogpt-web",
                     "messages": [{"role": "user", "content": "hello"}],
                 },
             )
             self.assertEqual(response.status_code, 200)
             payload = response.json()
-            self.assertEqual(payload["choices"][0]["message"]["content"], "api ok")
-            self.assertEqual(fake_agent.task, "hello")
+            self.assertEqual(payload["choices"][0]["message"]["content"], "agent ok")
+            self.assertEqual(fake_agent.task, "USER:\nhello\n\nASSISTANT:")
         finally:
             compat._agent = original_agent
+
+    def test_models_endpoint(self):
+        try:
+            from fastapi.testclient import TestClient
+        except Exception as exc:
+            self.skipTest(f"FastAPI TestClient unavailable: {exc}")
+
+        import internal_agent.server.openai_compat as compat
+
+        client = TestClient(compat.app)
+        response = client.get("/v1/models")
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["object"], "list")
+        self.assertEqual(payload["data"][0]["id"], "kingogpt-web")
+
+    def test_raw_chat_completion_streaming_smoke(self):
+        try:
+            from fastapi.testclient import TestClient
+        except Exception as exc:
+            self.skipTest(f"FastAPI TestClient unavailable: {exc}")
+
+        import internal_agent.server.openai_compat as compat
+
+        class FakeLLM:
+            def complete(self, prompt):
+                return "stream ok"
+
+        original_llm = compat._raw_llm
+        compat._raw_llm = FakeLLM()
+        try:
+            client = TestClient(compat.app)
+            with client.stream(
+                "POST",
+                "/v1/chat/completions",
+                json={
+                    "model": "kingogpt-web",
+                    "stream": True,
+                    "messages": [{"role": "user", "content": "hello"}],
+                },
+            ) as response:
+                self.assertEqual(response.status_code, 200)
+                self.assertIn("text/event-stream", response.headers["content-type"])
+                body = "".join(response.iter_text())
+
+            self.assertIn('"content": "stream ok"', body)
+            self.assertIn("data: [DONE]", body)
+        finally:
+            compat._raw_llm = original_llm
 
     def test_health_endpoint(self):
         try:
@@ -136,6 +226,10 @@ class OpenAICompatTests(unittest.TestCase):
         response = client.get("/health")
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["status"], "ok")
+        self.assertEqual(
+            response.json()["service"],
+            "kingogpt-openai-compatible",
+        )
 
 
 if __name__ == "__main__":
