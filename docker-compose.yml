@@ -1,0 +1,22 @@
+services:
+  kingogpt-agent:
+    build: .
+    image: kingogpt-internal-agent:latest
+    container_name: kingogpt-agent
+    ports:
+      - "127.0.0.1:8000:8000"
+    environment:
+      INTERNAL_AGENT_MAX_STEPS: "8"
+      INTERNAL_AGENT_SESSION_KEY: "internal_agent_api"
+      KINGOGPT_TOKEN_CACHE: "/app/state/kingogpt_token_cache.json"
+      KINGOGPT_TOKEN_CONFIG: "/app/state/kingogpt_config.json"
+      KINGOGPT_PROFILE_DIR: "/app/state/kingogpt_chrome_profile"
+      KINGOGPT_REQUEST_TIMEOUT: "120"
+      KINGOGPT_TOKEN_REFRESH_TIMEOUT: "300"
+      KINGOGPT_REUSE_THREAD: "false"
+      KINGOGPT_AUTO_DELETE_THREAD: "true"
+      KINGOGPT_ECHO_LLM: "false"
+    volumes:
+      - ./state:/app/state
+    shm_size: "1gb"
+    restart: unless-stopped

@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.py[cod]
+
+state/
+secrete/
+secrets/
+tmp_api_check/
+
+.env
+.env.*
+!.env.example
+
+*.log
