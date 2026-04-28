@@ -72,6 +72,13 @@ class ChatCompletionRequest(BaseModel):
     stream: bool = False
     temperature: float | None = None
     max_tokens: int | None = None
+    top_p: float | None = None
+    stop: str | list[str] | None = None
+    tools: list[dict[str, Any]] | None = None
+    tool_choice: Any | None = None
+    presence_penalty: float | None = None
+    frequency_penalty: float | None = None
+    user: str | None = None
 
 
 @app.get("/health")
@@ -169,6 +176,23 @@ def raw_chat_completions(req: ChatCompletionRequest):
                                 "index": 0,
                                 "delta": {
                                     "role": "assistant",
+                                },
+                                "finish_reason": None,
+                            }
+                        ],
+                    }
+                )
+
+                yield sse_event(
+                    {
+                        "id": "chatcmpl-kingogpt",
+                        "object": "chat.completion.chunk",
+                        "created": int(time.time()),
+                        "model": req.model,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {
                                     "content": answer,
                                 },
                                 "finish_reason": None,

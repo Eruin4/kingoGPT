@@ -1,3 +1,4 @@
+import json
 import unittest
 
 from internal_agent.agent.loop import Agent
@@ -105,9 +106,20 @@ class OpenAICompatTests(unittest.TestCase):
                 self.prompt = prompt
                 return "api ok"
 
+        class FakeAgent:
+            def __init__(self):
+                self.calls = 0
+
+            def run(self, task):
+                self.calls += 1
+                raise AssertionError("raw endpoint should not call agent")
+
         fake_llm = FakeLLM()
+        fake_agent = FakeAgent()
         original_llm = compat._raw_llm
+        original_agent = compat._agent
         compat._raw_llm = fake_llm
+        compat._agent = fake_agent
         try:
             client = TestClient(compat.app)
             response = client.post(
@@ -127,8 +139,10 @@ class OpenAICompatTests(unittest.TestCase):
                 fake_llm.prompt,
                 "SYSTEM:\nbe brief\n\nUSER:\nhello\n\nASSISTANT:",
             )
+            self.assertEqual(fake_agent.calls, 0)
         finally:
             compat._raw_llm = original_llm
+            compat._agent = original_agent
 
     def test_agent_chat_completion_endpoint_with_mock_agent(self):
         try:
@@ -209,8 +223,69 @@ class OpenAICompatTests(unittest.TestCase):
                 self.assertIn("text/event-stream", response.headers["content-type"])
                 body = "".join(response.iter_text())
 
-            self.assertIn('"content": "stream ok"', body)
+            data_lines = [
+                line.removeprefix("data: ")
+                for line in body.splitlines()
+                if line.startswith("data: ") and line != "data: [DONE]"
+            ]
+            chunks = [json.loads(line) for line in data_lines]
+            self.assertEqual(
+                chunks[0]["choices"][0]["delta"],
+                {"role": "assistant"},
+            )
+            self.assertEqual(
+                chunks[1]["choices"][0]["delta"],
+                {"content": "stream ok"},
+            )
+            self.assertEqual(chunks[2]["choices"][0]["finish_reason"], "stop")
             self.assertIn("data: [DONE]", body)
+        finally:
+            compat._raw_llm = original_llm
+
+    def test_raw_chat_completion_accepts_extra_openai_fields(self):
+        try:
+            from fastapi.testclient import TestClient
+        except Exception as exc:
+            self.skipTest(f"FastAPI TestClient unavailable: {exc}")
+
+        import internal_agent.server.openai_compat as compat
+
+        class FakeLLM:
+            def complete(self, prompt):
+                return "extra ok"
+
+        original_llm = compat._raw_llm
+        compat._raw_llm = FakeLLM()
+        try:
+            client = TestClient(compat.app)
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "kingogpt-web",
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "top_p": 0.9,
+                    "stop": ["END"],
+                    "tools": [
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "read_file",
+                                "description": "Read a file",
+                                "parameters": {"type": "object"},
+                            },
+                        }
+                    ],
+                    "tool_choice": "auto",
+                    "presence_penalty": 0.1,
+                    "frequency_penalty": 0.2,
+                    "user": "hermes-local",
+                },
+            )
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(
+                response.json()["choices"][0]["message"]["content"],
+                "extra ok",
+            )
         finally:
             compat._raw_llm = original_llm
 
