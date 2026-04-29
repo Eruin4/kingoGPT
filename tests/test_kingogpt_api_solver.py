@@ -35,7 +35,7 @@ class KingoGPTApiSolverPromptTests(unittest.TestCase):
         self.assertEqual(payload["llms"]["reply_style_prompt"], "normal")
         self.assertNotIn("instruction", payload)
 
-    def test_build_payload_sends_system_prompt_as_instruction(self):
+    def test_build_payload_sends_system_prompt_only_as_instruction(self):
         args = argparse.Namespace(scenario_id="scenario-1")
         user = {"id": 123, "loginId": "user1"}
 
@@ -43,12 +43,12 @@ class KingoGPTApiSolverPromptTests(unittest.TestCase):
 
         self.assertEqual(payload["queries"], {"type": "text", "text": "USER:\nhello"})
         self.assertEqual(payload["instruction"], "be brief")
-        self.assertEqual(payload["llms"]["reply_style_prompt"], "be brief")
+        self.assertEqual(payload["llms"]["reply_style_prompt"], "normal")
 
     def test_build_payload_does_not_send_oversized_reply_style_prompt(self):
         args = argparse.Namespace(scenario_id="scenario-1")
         user = {"id": 123, "loginId": "user1"}
-        instruction = "x" * (solver.MAX_REPLY_STYLE_PROMPT_CHARS + 1)
+        instruction = "x" * 20_000
 
         payload = solver.build_payload(user, "USER:\nhello", args, instruction=instruction)
 
