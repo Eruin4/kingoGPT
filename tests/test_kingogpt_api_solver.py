@@ -45,6 +45,16 @@ class KingoGPTApiSolverPromptTests(unittest.TestCase):
         self.assertEqual(payload["instruction"], "be brief")
         self.assertEqual(payload["llms"]["reply_style_prompt"], "be brief")
 
+    def test_build_payload_does_not_send_oversized_reply_style_prompt(self):
+        args = argparse.Namespace(scenario_id="scenario-1")
+        user = {"id": 123, "loginId": "user1"}
+        instruction = "x" * (solver.MAX_REPLY_STYLE_PROMPT_CHARS + 1)
+
+        payload = solver.build_payload(user, "USER:\nhello", args, instruction=instruction)
+
+        self.assertEqual(payload["instruction"], instruction)
+        self.assertEqual(payload["llms"]["reply_style_prompt"], "normal")
+
 
 class KingoGPTTokenRefreshTests(unittest.TestCase):
     def test_corrupt_token_cache_error_triggers_auto_refresh(self):

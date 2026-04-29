@@ -18,6 +18,7 @@ DEFAULT_SCENARIO_ID = "robi-gpt-dev:workflow_c0hfnXS236g4FKO"
 DEFAULT_CHAT_ROOM_ID = 14
 DEFAULT_TOKEN_CACHE = Path(__file__).with_name("kingogpt_token_cache.json")
 TOKEN_EXPIRY_SKEW_SECONDS = 300
+MAX_REPLY_STYLE_PROMPT_CHARS = 12_288
 
 
 def configure_output() -> None:
@@ -311,6 +312,16 @@ def build_request_prompt(prompt: str, system_prompt: str | None) -> str:
     return "\n\n".join(blocks).strip()
 
 
+def resolve_reply_style_prompt(instruction: str | None) -> str:
+    if not instruction:
+        return "normal"
+
+    reply_style_prompt = instruction.strip()
+    if len(reply_style_prompt) > MAX_REPLY_STYLE_PROMPT_CHARS:
+        return "normal"
+    return reply_style_prompt
+
+
 def build_payload(
     user: dict,
     prompt: str,
@@ -334,7 +345,7 @@ def build_payload(
     if user.get("status"):
         param_filters["status"] = user["status"]
 
-    reply_style_prompt = instruction.strip() if instruction else "normal"
+    reply_style_prompt = resolve_reply_style_prompt(instruction)
 
     payload = {
         "app_type": "browser",
