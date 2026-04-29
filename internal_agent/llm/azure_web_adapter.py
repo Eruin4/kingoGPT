@@ -62,6 +62,11 @@ class AzureWebLLM:
         prompt_hash = kingogpt.create_prompt_hash(system_prompt or "internal-agent-adapter-v1")
         return kingogpt.build_state_key(self.session_key, prompt_hash)
 
+    def _prompt_with_system(self, prompt: str, system_prompt: str | None) -> str:
+        if not system_prompt or not system_prompt.strip():
+            return prompt
+        return f"SYSTEM:\n{system_prompt.strip()}\n\n{prompt}"
+
     def _chat_via_api(
         self,
         token: str,
@@ -72,13 +77,14 @@ class AzureWebLLM:
         chat_room_id: int | None,
         chat_thread_id: int | None,
     ) -> tuple[str, int | None, int | None]:
+        api_prompt = self._prompt_with_system(prompt, system_prompt)
         if self.echo:
             return kingogpt.chat_via_api(
                 token,
                 user,
-                prompt,
+                api_prompt,
                 self._args,
-                instruction=system_prompt,
+                instruction=None,
                 chat_room_id=chat_room_id,
                 chat_thread_id=chat_thread_id,
             )
@@ -87,9 +93,9 @@ class AzureWebLLM:
             return kingogpt.chat_via_api(
                 token,
                 user,
-                prompt,
+                api_prompt,
                 self._args,
-                instruction=system_prompt,
+                instruction=None,
                 chat_room_id=chat_room_id,
                 chat_thread_id=chat_thread_id,
             )
@@ -116,6 +122,9 @@ class AzureWebLLM:
         current_thread_id = (
             (existing_state or {}).get("chatThreadId") if self.reuse_thread else None
         )
+        system_prompt_for_request = (
+            None if self.reuse_thread and existing_state else system_prompt
+        )
 
         try:
             try:
@@ -123,7 +132,7 @@ class AzureWebLLM:
                     token,
                     user,
                     prompt,
-                    system_prompt=None if existing_state else system_prompt,
+                    system_prompt=system_prompt_for_request,
                     chat_room_id=current_room_id,
                     chat_thread_id=current_thread_id,
                 )
@@ -141,7 +150,7 @@ class AzureWebLLM:
                     token,
                     user,
                     prompt,
-                    system_prompt=None if existing_state else system_prompt,
+                    system_prompt=system_prompt_for_request,
                     chat_room_id=current_room_id,
                     chat_thread_id=current_thread_id,
                 )

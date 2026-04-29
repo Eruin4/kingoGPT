@@ -565,7 +565,7 @@ def main() -> int:
 
         request_prompt = build_request_prompt(
             user_prompt,
-            None,
+            None if existing_state else dynamic_system_prompt,
         )
 
         try:
@@ -575,7 +575,7 @@ def main() -> int:
                     user,
                     request_prompt,
                     args,
-                    instruction=dynamic_system_prompt if not existing_state else None,
+                    instruction=None,
                     chat_room_id=current_room_id,
                     chat_thread_id=current_thread_id,
                 )
@@ -594,7 +594,7 @@ def main() -> int:
                     user,
                     request_prompt,
                     args,
-                    instruction=dynamic_system_prompt if not existing_state else None,
+                    instruction=None,
                     chat_room_id=current_room_id,
                     chat_thread_id=current_thread_id,
                 )
@@ -606,14 +606,14 @@ def main() -> int:
             delete_session_prompt_state(cache, state_key)
             reset_request_prompt = build_request_prompt(
                 user_prompt,
-                None,
+                dynamic_system_prompt,
             )
             _, resolved_room_id, resolved_thread_id = chat_via_api(
                 token,
                 user,
                 reset_request_prompt,
                 args,
-                instruction=dynamic_system_prompt,
+                instruction=None,
                 chat_room_id=current_room_id,
             )
 

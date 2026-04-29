@@ -1,6 +1,7 @@
 import os
 import time
 import json
+import logging
 from typing import Any
 
 from fastapi import FastAPI, HTTPException
@@ -17,6 +18,11 @@ from internal_agent.llm.azure_web_adapter import AzureWebLLM
 
 
 app = FastAPI()
+logger = logging.getLogger("kingogpt.openai_compat")
+
+DEFAULT_MAX_HISTORY_MESSAGES = 16
+DEFAULT_MAX_PROMPT_CHARS = 12_000
+DEFAULT_MODEL_ID = "kingogpt-web"
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -77,7 +83,7 @@ def get_agent():
 class ChatCompletionRequest(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
-    model: str = "kingogpt-web"
+    model: str = DEFAULT_MODEL_ID
     messages: list[dict[str, Any]]
     stream: bool = False
     temperature: float | None = None
@@ -91,24 +97,57 @@ class ChatCompletionRequest(BaseModel):
     user: str | None = None
 
 
+class ResponsesRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    model: str = DEFAULT_MODEL_ID
+    input: str | list[Any]
+    instructions: str | None = None
+    stream: bool = False
+    tools: list[dict[str, Any]] | None = None
+    tool_choice: Any | None = None
+    temperature: float | None = None
+    max_output_tokens: int | None = None
+    top_p: float | None = None
+    user: str | None = None
+
+
 @app.get("/health")
 def health():
     return {"status": "ok", "service": "kingogpt-openai-compatible"}
+
+
+def model_object(model_id: str = DEFAULT_MODEL_ID) -> dict[str, Any]:
+    return {
+        "id": model_id,
+        "object": "model",
+        "created": 0,
+        "owned_by": "kingogpt",
+    }
 
 
 @app.get("/v1/models")
 def list_models():
     return {
         "object": "list",
-        "data": [
-            {
-                "id": "kingogpt-web",
-                "object": "model",
-                "created": int(time.time()),
-                "owned_by": "kingogpt",
-            }
-        ],
+        "data": [model_object()],
     }
+
+
+@app.get("/v1/models/{model_id}")
+def retrieve_model(model_id: str):
+    if model_id != DEFAULT_MODEL_ID:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": {
+                    "message": f"Model '{model_id}' not found.",
+                    "type": "invalid_request_error",
+                    "code": "model_not_found",
+                }
+            },
+        )
+    return model_object(model_id)
 
 
 def _content_to_text(content: Any) -> str:
@@ -127,9 +166,65 @@ def _content_to_text(content: Any) -> str:
     return "" if content is None else str(content)
 
 
+def summarize_tools(tools: list[dict[str, Any]] | None) -> list[str]:
+    if not tools:
+        return []
+    names: list[str] = []
+    for tool in tools:
+        tool_type = tool.get("type", "unknown")
+        if tool_type == "function":
+            function = tool.get("function") or {}
+            names.append(f"function:{function.get('name', 'unknown')}")
+        else:
+            names.append(str(tool_type))
+    return names
+
+
+def log_openai_request(endpoint: str, req: ChatCompletionRequest | ResponsesRequest) -> None:
+    if not _env_bool("KINGOGPT_DEBUG_OPENAI_REQUESTS"):
+        return
+    message_count = len(req.messages) if isinstance(req, ChatCompletionRequest) else None
+    input_type = type(req.input).__name__ if isinstance(req, ResponsesRequest) else None
+    logger.warning(
+        "openai_request endpoint=%s model=%s stream=%s messages=%s input_type=%s "
+        "tools=%s tool_choice=%r",
+        endpoint,
+        req.model,
+        req.stream,
+        message_count,
+        input_type,
+        summarize_tools(req.tools),
+        req.tool_choice,
+    )
+
+
+def trim_history_blocks(blocks: list[str], *, max_messages: int, max_chars: int) -> list[str]:
+    if max_messages > 0:
+        blocks = blocks[-max_messages:]
+    if max_chars <= 0:
+        return blocks
+
+    kept: list[str] = []
+    total = 0
+    for block in reversed(blocks):
+        separator = 2 if kept else 0
+        next_total = total + separator + len(block)
+        if kept and next_total > max_chars:
+            break
+        if next_total > max_chars:
+            kept.append(block[-max_chars:])
+            break
+        kept.append(block)
+        total = next_total
+    kept.reverse()
+    return kept
+
+
 def messages_to_prompt_and_system(messages: list[dict[str, Any]]) -> tuple[str, str]:
     blocks: list[str] = []
     system_blocks: list[str] = []
+    max_messages = _env_int("KINGOGPT_MAX_HISTORY_MESSAGES", DEFAULT_MAX_HISTORY_MESSAGES)
+    max_chars = _env_int("KINGOGPT_MAX_PROMPT_CHARS", DEFAULT_MAX_PROMPT_CHARS)
 
     for message in messages:
         role = message.get("role", "user")
@@ -141,6 +236,7 @@ def messages_to_prompt_and_system(messages: list[dict[str, Any]]) -> tuple[str, 
         else:
             blocks.append(f"{role.upper()}:\n{content}")
 
+    blocks = trim_history_blocks(blocks, max_messages=max_messages, max_chars=max_chars)
     blocks.append("ASSISTANT:")
     return "\n\n".join(blocks), "\n\n".join(system_blocks)
 
@@ -150,6 +246,21 @@ def messages_to_prompt(messages: list[dict[str, Any]]) -> str:
     if system_prompt:
         return f"SYSTEM:\n{system_prompt}\n\n{prompt}"
     return prompt
+
+
+def responses_input_to_messages(input_data: str | list[Any]) -> list[dict[str, Any]]:
+    if isinstance(input_data, str):
+        return [{"role": "user", "content": input_data}]
+
+    messages: list[dict[str, Any]] = []
+    for item in input_data:
+        if isinstance(item, dict):
+            role = item.get("role") or ("assistant" if item.get("type") == "message" else "user")
+            content = item.get("content")
+            messages.append({"role": role, "content": content})
+        else:
+            messages.append({"role": "user", "content": str(item)})
+    return messages
 
 
 def make_completion_response(model: str, content: str) -> dict[str, Any]:
@@ -175,11 +286,40 @@ def sse_event(data: dict[str, Any]) -> str:
     return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
+def make_responses_response(model: str, content: str) -> dict[str, Any]:
+    response_id = "resp_kingogpt"
+    return {
+        "id": response_id,
+        "object": "response",
+        "created_at": int(time.time()),
+        "status": "completed",
+        "model": model,
+        "output": [
+            {
+                "id": "msg_kingogpt",
+                "type": "message",
+                "status": "completed",
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": content,
+                        "annotations": [],
+                    }
+                ],
+            }
+        ],
+        "output_text": content,
+        "usage": None,
+    }
+
+
 @app.post("/v1/chat/completions")
 def raw_chat_completions(req: ChatCompletionRequest):
     """
     Raw OpenAI-compatible model endpoint. Hermes should use this endpoint.
     """
+    log_openai_request("/v1/chat/completions", req)
     prompt, system_prompt = messages_to_prompt_and_system(req.messages)
 
     if req.stream:
@@ -267,6 +407,66 @@ def raw_chat_completions(req: ChatCompletionRequest):
         ) from exc
 
     return make_completion_response(req.model, answer)
+
+
+@app.post("/v1/responses")
+def responses(req: ResponsesRequest):
+    """
+    Minimal Responses API compatibility. Built-in hosted tools are not executed here yet;
+    request debug logging is used to verify what Hermes sends.
+    """
+    log_openai_request("/v1/responses", req)
+    messages = responses_input_to_messages(req.input)
+    prompt, system_prompt = messages_to_prompt_and_system(messages)
+    if req.instructions:
+        system_prompt = "\n\n".join(part for part in (req.instructions, system_prompt) if part)
+
+    if req.stream:
+        def generate():
+            try:
+                answer = _raw_llm.complete(prompt, system_prompt=system_prompt)
+                yield sse_event(
+                    {
+                        "type": "response.output_text.delta",
+                        "response_id": "resp_kingogpt",
+                        "delta": answer,
+                    }
+                )
+                yield sse_event(
+                    {
+                        "type": "response.completed",
+                        "response": make_responses_response(req.model, answer),
+                    }
+                )
+                yield "data: [DONE]\n\n"
+            except Exception as exc:
+                yield sse_event(
+                    {
+                        "type": "response.failed",
+                        "error": {
+                            "message": str(exc),
+                            "type": "kingogpt_backend_error",
+                        },
+                    }
+                )
+                yield "data: [DONE]\n\n"
+
+        return StreamingResponse(generate(), media_type="text/event-stream")
+
+    try:
+        answer = _raw_llm.complete(prompt, system_prompt=system_prompt)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "error": {
+                    "message": str(exc),
+                    "type": "kingogpt_backend_error",
+                }
+            },
+        ) from exc
+
+    return make_responses_response(req.model, answer)
 
 
 @app.post("/v1/agent/chat/completions")
