@@ -1,11 +1,11 @@
 from collections.abc import Callable
 from typing import Any
 
-from internal_agent.agent.parser import extract_json, validate_action
-from internal_agent.agent.prompts import build_agent_prompt, build_repair_prompt
-from internal_agent.agent.state import make_history_entry
 from internal_agent.config import DEFAULT_MAX_STEPS
-from internal_agent.tools.registry import execute_tool
+from internal_agent.standalone.agent.parser import extract_json, validate_action
+from internal_agent.standalone.agent.prompts import build_agent_prompt, build_repair_prompt
+from internal_agent.standalone.agent.state import make_history_entry
+from internal_agent.standalone.tools.registry import execute_tool
 
 
 ToolExecutor = Callable[[str, dict[str, Any]], str]

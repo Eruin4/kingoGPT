@@ -58,8 +58,8 @@ class AzureWebLLM:
             session_key=session_key,
         )
 
-    def _state_key(self) -> str:
-        prompt_hash = kingogpt.create_prompt_hash("internal-agent-adapter-v1")
+    def _state_key(self, system_prompt: str | None = None) -> str:
+        prompt_hash = kingogpt.create_prompt_hash(system_prompt or "internal-agent-adapter-v1")
         return kingogpt.build_state_key(self.session_key, prompt_hash)
 
     def _chat_via_api(
@@ -68,6 +68,7 @@ class AzureWebLLM:
         user: dict,
         prompt: str,
         *,
+        system_prompt: str | None,
         chat_room_id: int | None,
         chat_thread_id: int | None,
     ) -> tuple[str, int | None, int | None]:
@@ -77,6 +78,7 @@ class AzureWebLLM:
                 user,
                 prompt,
                 self._args,
+                instruction=system_prompt,
                 chat_room_id=chat_room_id,
                 chat_thread_id=chat_thread_id,
             )
@@ -87,17 +89,18 @@ class AzureWebLLM:
                 user,
                 prompt,
                 self._args,
+                instruction=system_prompt,
                 chat_room_id=chat_room_id,
                 chat_thread_id=chat_thread_id,
             )
 
-    def complete(self, prompt: str) -> str:
+    def complete(self, prompt: str, *, system_prompt: str | None = None) -> str:
         """Send prompt to KingoGPT and return the full streamed answer."""
         with self._lock:
-            return self._complete_locked(prompt)
+            return self._complete_locked(prompt, system_prompt=system_prompt)
 
-    def _complete_locked(self, prompt: str) -> str:
-        state_key = self._state_key()
+    def _complete_locked(self, prompt: str, *, system_prompt: str | None = None) -> str:
+        state_key = self._state_key(system_prompt)
         cache, token, claims, user = kingogpt.load_or_refresh_token(self._args)
         if not user.get("id"):
             user["id"] = claims.get("userId")
@@ -120,6 +123,7 @@ class AzureWebLLM:
                     token,
                     user,
                     prompt,
+                    system_prompt=None if existing_state else system_prompt,
                     chat_room_id=current_room_id,
                     chat_thread_id=current_thread_id,
                 )
@@ -137,6 +141,7 @@ class AzureWebLLM:
                     token,
                     user,
                     prompt,
+                    system_prompt=None if existing_state else system_prompt,
                     chat_room_id=current_room_id,
                     chat_thread_id=current_thread_id,
                 )
@@ -149,6 +154,7 @@ class AzureWebLLM:
                 token,
                 user,
                 prompt,
+                system_prompt=system_prompt,
                 chat_room_id=current_room_id,
                 chat_thread_id=None,
             )
@@ -158,7 +164,7 @@ class AzureWebLLM:
         kingogpt.write_session_prompt_state(
             cache,
             state_key,
-            prompt_hash=kingogpt.create_prompt_hash("internal-agent-adapter-v1"),
+            prompt_hash=kingogpt.create_prompt_hash(system_prompt or "internal-agent-adapter-v1"),
             chat_room_id=resolved_room_id,
             chat_thread_id=resolved_thread_id if self.reuse_thread else None,
         )

@@ -65,7 +65,7 @@ _agent = None
 def get_agent():
     global _agent
     if _agent is None:
-        from internal_agent.agent.loop import Agent
+        from internal_agent.standalone.agent.loop import Agent
 
         _agent = Agent(
             create_llm_from_env("kingogpt_agent"),
@@ -127,17 +127,29 @@ def _content_to_text(content: Any) -> str:
     return "" if content is None else str(content)
 
 
-def messages_to_prompt(messages: list[dict[str, Any]]) -> str:
+def messages_to_prompt_and_system(messages: list[dict[str, Any]]) -> tuple[str, str]:
     blocks: list[str] = []
+    system_blocks: list[str] = []
 
     for message in messages:
         role = message.get("role", "user")
         content = _content_to_text(message.get("content"))
-        if content.strip():
+        if not content.strip():
+            continue
+        if role == "system":
+            system_blocks.append(content)
+        else:
             blocks.append(f"{role.upper()}:\n{content}")
 
     blocks.append("ASSISTANT:")
-    return "\n\n".join(blocks)
+    return "\n\n".join(blocks), "\n\n".join(system_blocks)
+
+
+def messages_to_prompt(messages: list[dict[str, Any]]) -> str:
+    prompt, system_prompt = messages_to_prompt_and_system(messages)
+    if system_prompt:
+        return f"SYSTEM:\n{system_prompt}\n\n{prompt}"
+    return prompt
 
 
 def make_completion_response(model: str, content: str) -> dict[str, Any]:
@@ -168,12 +180,12 @@ def raw_chat_completions(req: ChatCompletionRequest):
     """
     Raw OpenAI-compatible model endpoint. Hermes should use this endpoint.
     """
-    prompt = messages_to_prompt(req.messages)
+    prompt, system_prompt = messages_to_prompt_and_system(req.messages)
 
     if req.stream:
         def generate():
             try:
-                answer = _raw_llm.complete(prompt)
+                answer = _raw_llm.complete(prompt, system_prompt=system_prompt)
 
                 yield sse_event(
                     {
@@ -242,7 +254,7 @@ def raw_chat_completions(req: ChatCompletionRequest):
         return StreamingResponse(generate(), media_type="text/event-stream")
 
     try:
-        answer = _raw_llm.complete(prompt)
+        answer = _raw_llm.complete(prompt, system_prompt=system_prompt)
     except Exception as exc:
         raise HTTPException(
             status_code=502,

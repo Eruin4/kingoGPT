@@ -2,9 +2,9 @@ import argparse
 import json
 import sys
 
-from internal_agent.agent.loop import Agent
 from internal_agent.config import DEFAULT_MAX_STEPS
 from internal_agent.llm.azure_web_adapter import AzureWebLLM
+from internal_agent.standalone.agent.loop import Agent
 
 
 class StaticLLM:

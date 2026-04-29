@@ -1,8 +1,8 @@
 import json
 import unittest
 
-from internal_agent.agent.loop import Agent
-from internal_agent.agent.parser import extract_json, validate_action
+from internal_agent.standalone.agent.loop import Agent
+from internal_agent.standalone.agent.parser import extract_json, validate_action
 
 
 class FakeLLM:
@@ -101,9 +101,11 @@ class OpenAICompatTests(unittest.TestCase):
         class FakeLLM:
             def __init__(self):
                 self.prompt = None
+                self.system_prompt = None
 
-            def complete(self, prompt):
+            def complete(self, prompt, *, system_prompt=None):
                 self.prompt = prompt
+                self.system_prompt = system_prompt
                 return "api ok"
 
         class FakeAgent:
@@ -137,8 +139,9 @@ class OpenAICompatTests(unittest.TestCase):
             self.assertEqual(payload["choices"][0]["message"]["content"], "api ok")
             self.assertEqual(
                 fake_llm.prompt,
-                "SYSTEM:\nbe brief\n\nUSER:\nhello\n\nASSISTANT:",
+                "USER:\nhello\n\nASSISTANT:",
             )
+            self.assertEqual(fake_llm.system_prompt, "be brief")
             self.assertEqual(fake_agent.calls, 0)
         finally:
             compat._raw_llm = original_llm
@@ -203,7 +206,7 @@ class OpenAICompatTests(unittest.TestCase):
         import internal_agent.server.openai_compat as compat
 
         class FakeLLM:
-            def complete(self, prompt):
+            def complete(self, prompt, *, system_prompt=None):
                 return "stream ok"
 
         original_llm = compat._raw_llm
@@ -251,7 +254,7 @@ class OpenAICompatTests(unittest.TestCase):
         import internal_agent.server.openai_compat as compat
 
         class FakeLLM:
-            def complete(self, prompt):
+            def complete(self, prompt, *, system_prompt=None):
                 return "extra ok"
 
         original_llm = compat._raw_llm

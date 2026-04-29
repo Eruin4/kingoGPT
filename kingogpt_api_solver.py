@@ -127,7 +127,8 @@ def load_token_cache(path_str: str) -> dict:
 
 def write_token_cache(path_str: str, cache: dict) -> None:
     path = Path(path_str)
-    path.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(cache, ensure_ascii=True, indent=2), encoding="utf-8")
 
 
 def resolve_access_token(args: argparse.Namespace, cache: dict) -> str:
@@ -165,6 +166,7 @@ def should_auto_refresh_token(error: Exception) -> bool:
         for needle in (
             "access token is missing",
             "expired or about to expire",
+            "failed to parse token cache file",
             "http 401",
             "http 403",
             "returned html instead of json",
@@ -191,6 +193,7 @@ def refresh_token_cache(args: argparse.Namespace) -> dict:
         config_file=args.token_config,
         profile_dir=args.profile_dir,
         timeout=args.token_refresh_timeout,
+        chrome_path=None,
         login_id=None,
         password=None,
     )
@@ -313,6 +316,7 @@ def build_payload(
     prompt: str,
     args: argparse.Namespace,
     *,
+    instruction: str | None = None,
     chat_room_id: int | None = None,
     chat_thread_id: int | None = None,
 ) -> dict:
@@ -330,6 +334,8 @@ def build_payload(
     if user.get("status"):
         param_filters["status"] = user["status"]
 
+    reply_style_prompt = instruction.strip() if instruction else "normal"
+
     payload = {
         "app_type": "browser",
         "device_type": "pc",
@@ -341,12 +347,14 @@ def build_payload(
                 "model_name": "gpt-5.2",
                 "deployment_name": "gpt-5.2-gs-2025-12-11",
             },
-            "reply_style_prompt": "normal",
+            "reply_style_prompt": reply_style_prompt,
         },
         "queries": {"type": "text", "text": prompt},
         "param_filters": param_filters,
         "sse_status_enabled": True,
     }
+    if instruction:
+        payload["instruction"] = instruction.strip()
     if chat_room_id is not None:
         payload["chat_rooms_id"] = int(chat_room_id)
     if chat_thread_id is not None:
@@ -463,6 +471,7 @@ def chat_via_api(
     prompt: str,
     args: argparse.Namespace,
     *,
+    instruction: str | None = None,
     chat_room_id: int | None = None,
     chat_thread_id: int | None = None,
 ) -> tuple[str, int | None, int | None]:
@@ -480,6 +489,7 @@ def chat_via_api(
         user,
         prompt,
         args,
+        instruction=instruction,
         chat_room_id=chat_room_id,
         chat_thread_id=chat_thread_id,
     )
@@ -557,7 +567,7 @@ def main() -> int:
 
         request_prompt = build_request_prompt(
             user_prompt,
-            None if existing_state else dynamic_system_prompt,
+            None,
         )
 
         try:
@@ -567,6 +577,7 @@ def main() -> int:
                     user,
                     request_prompt,
                     args,
+                    instruction=dynamic_system_prompt if not existing_state else None,
                     chat_room_id=current_room_id,
                     chat_thread_id=current_thread_id,
                 )
@@ -585,6 +596,7 @@ def main() -> int:
                     user,
                     request_prompt,
                     args,
+                    instruction=dynamic_system_prompt if not existing_state else None,
                     chat_room_id=current_room_id,
                     chat_thread_id=current_thread_id,
                 )
@@ -596,13 +608,14 @@ def main() -> int:
             delete_session_prompt_state(cache, state_key)
             reset_request_prompt = build_request_prompt(
                 user_prompt,
-                dynamic_system_prompt,
+                None,
             )
             _, resolved_room_id, resolved_thread_id = chat_via_api(
                 token,
                 user,
                 reset_request_prompt,
                 args,
+                instruction=dynamic_system_prompt,
                 chat_room_id=current_room_id,
             )
 

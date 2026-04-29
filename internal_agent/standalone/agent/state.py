@@ -15,4 +15,3 @@ def make_history_entry(
         "args": args,
         "observation": observation[:limit],
     }
-

@@ -52,8 +52,7 @@ def decode_jwt_payload(token: str) -> dict:
         raise RuntimeError("Failed to decode access token JWT.") from exc
 
 
-def load_json_file(path_str: str) -> dict:
-    path = Path(path_str)
+def load_json_file(path: Path) -> dict:
     if not path.exists():
         return {}
     try:
@@ -62,10 +61,33 @@ def load_json_file(path_str: str) -> dict:
         raise RuntimeError(f"Failed to parse JSON file: {path}") from exc
 
 
+def candidate_config_files(path_str: str) -> list[Path]:
+    script_dir = Path(__file__).resolve().parent
+    candidates = [
+        Path(path_str),
+        script_dir / "state" / "kingogpt_config.json",
+        script_dir / "kingogpt_config.json",
+    ]
+
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for path in candidates:
+        key = str(path.resolve()) if path.exists() else str(path)
+        if key not in seen:
+            seen.add(key)
+            unique.append(path)
+    return unique
+
+
 def resolve_credentials(args: argparse.Namespace) -> tuple[str, str]:
-    config = load_json_file(args.config_file)
-    login_id = (args.login_id or os.getenv("KINGOGPT_ID") or config.get("id") or "").strip()
-    password = args.password or os.getenv("KINGOGPT_PW") or config.get("password") or ""
+    configs = [load_json_file(path) for path in candidate_config_files(args.config_file)]
+    config_login_id = next((config.get("id") for config in configs if config.get("id")), "")
+    config_password = next(
+        (config.get("password") for config in configs if config.get("password")),
+        "",
+    )
+    login_id = (args.login_id or os.getenv("KINGOGPT_ID") or config_login_id or "").strip()
+    password = args.password or os.getenv("KINGOGPT_PW") or config_password or ""
     return login_id, password
 
 
@@ -195,7 +217,7 @@ async def attempt_auto_login(page, login_id: str, password: str) -> bool:
 def write_cache(path_str: str, cache_data: dict) -> None:
     path = Path(path_str)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(cache_data, ensure_ascii=False, indent=2), encoding="utf-8")
+    path.write_text(json.dumps(cache_data, ensure_ascii=True, indent=2), encoding="utf-8")
 
 
 async def refresh_token_cache(args: argparse.Namespace) -> dict:

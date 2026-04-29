@@ -28,4 +28,3 @@ def run_python(code: str) -> str:
         return str(local_vars)
     except Exception as exc:
         return f"ERROR: {type(exc).__name__}: {exc}"
-

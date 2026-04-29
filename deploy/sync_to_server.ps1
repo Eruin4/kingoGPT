@@ -9,16 +9,30 @@ $ErrorActionPreference = "Stop"
 $RepoRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
 $Archive = Join-Path $env:TEMP "kingogpt-agent.tar.gz"
 $Excludes = @(
-    "--exclude=.git",
-    "--exclude=.venv",
     "--exclude=__pycache__",
     "--exclude=*.pyc",
     "--exclude=.pytest_cache",
-    "--exclude=secrets"
+    "--exclude=state/pip_tmp"
 )
 
 if (-not $IncludeState) {
     $Excludes += "--exclude=state"
+}
+
+$ArchiveItems = @(
+    "deploy",
+    "internal_agent",
+    "scripts",
+    "tests",
+    "Dockerfile",
+    "docker-compose.yml",
+    "requirements.txt",
+    "kingogpt_api_solver.py",
+    "kingogpt_token_capture.py"
+)
+
+if ($IncludeState) {
+    $ArchiveItems += "state"
 }
 
 if (Test-Path $Archive) {
@@ -27,15 +41,21 @@ if (Test-Path $Archive) {
 
 Push-Location $RepoRoot
 try {
-    & tar -czf $Archive @Excludes .
+    & tar -czf $Archive @Excludes @ArchiveItems
 }
 finally {
     Pop-Location
 }
 
-& ssh $HostName "mkdir -p '$RemoteDir'"
-& scp $Archive "${HostName}:$RemoteDir/kingogpt-agent.tar.gz"
-& ssh $HostName "cd '$RemoteDir' && tar -xzf kingogpt-agent.tar.gz && rm kingogpt-agent.tar.gz && chmod +x deploy/remote_bootstrap.sh"
+$KnownHosts = Join-Path $RepoRoot "state\ssh_known_hosts"
+$SshOptions = @(
+    "-o", "StrictHostKeyChecking=no",
+    "-o", "UserKnownHostsFile=$KnownHosts"
+)
+
+& ssh @SshOptions $HostName "mkdir -p '$RemoteDir'"
+& scp @SshOptions $Archive "${HostName}:$RemoteDir/kingogpt-agent.tar.gz"
+& ssh @SshOptions $HostName "cd '$RemoteDir' && tar -xzf kingogpt-agent.tar.gz && rm kingogpt-agent.tar.gz && chmod +x deploy/remote_bootstrap.sh"
 
 Write-Host "Synced to $($HostName):$RemoteDir"
 Write-Host "Next on server: cd $RemoteDir && ./deploy/remote_bootstrap.sh"
