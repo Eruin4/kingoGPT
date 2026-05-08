@@ -22,11 +22,13 @@ if (-not $IncludeState) {
 $ArchiveItems = @(
     "deploy",
     "internal_agent",
+    "kingogpt",
     "scripts",
     "tests",
     "Dockerfile",
     "docker-compose.yml",
     "requirements.txt",
+    "kingogpt_openai_server.py",
     "kingogpt_api_solver.py",
     "kingogpt_token_capture.py"
 )

@@ -91,6 +91,137 @@ class AgentLoopTests(unittest.TestCase):
 
 
 class OpenAICompatTests(unittest.TestCase):
+    def test_kingogpt_tool_call_json_maps_to_openai_tool_call(self):
+        from kingogpt.tool_adapter import convert_kingogpt_json_to_openai_message
+
+        message = convert_kingogpt_json_to_openai_message(
+            '{"type":"tool_call","name":"read","arguments":{"path":"README.md"}}'
+        )
+
+        self.assertIsNone(message["content"])
+        tool_call = message["tool_calls"][0]
+        self.assertEqual(tool_call["type"], "function")
+        self.assertEqual(tool_call["function"]["name"], "read")
+        self.assertEqual(
+            json.loads(tool_call["function"]["arguments"]),
+            {"path": "README.md"},
+        )
+
+    def test_kingogpt_legacy_call_json_maps_to_openai_tool_call(self):
+        from kingogpt.tool_adapter import convert_kingogpt_json_to_openai_message
+
+        message = convert_kingogpt_json_to_openai_message(
+            '{"call":"exec","args":{"command":"pwd"}}'
+        )
+
+        tool_call = message["tool_calls"][0]
+        self.assertEqual(tool_call["function"]["name"], "exec")
+        self.assertEqual(
+            json.loads(tool_call["function"]["arguments"]),
+            {"command": "pwd"},
+        )
+
+    def test_kingogpt_final_json_maps_to_assistant_content(self):
+        from kingogpt.tool_adapter import convert_kingogpt_json_to_openai_message
+
+        message = convert_kingogpt_json_to_openai_message(
+            '{"type":"final","content":"done"}'
+        )
+
+        self.assertEqual(message, {"role": "assistant", "content": "done"})
+
+    def test_kingogpt_fenced_tool_call_json_maps_to_openai_tool_call(self):
+        from kingogpt.tool_adapter import convert_kingogpt_json_to_openai_message
+
+        message = convert_kingogpt_json_to_openai_message(
+            '```json\n{"type":"tool_call","name":"read","arguments":{"path":"README.md"}}\n```'
+        )
+
+        self.assertEqual(message["tool_calls"][0]["function"]["name"], "read")
+
+    def test_sanitize_tool_calls_strips_non_openai_fields(self):
+        from kingogpt.tool_adapter import sanitize_openai_tool_calls
+
+        sanitized = sanitize_openai_tool_calls(
+            [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "call_id": "extra",
+                    "response_item_id": "extra",
+                    "function": {
+                        "name": "read",
+                        "arguments": {"path": "README.md"},
+                        "extra": "ignored",
+                    },
+                }
+            ]
+        )
+
+        self.assertEqual(
+            sanitized,
+            [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "read",
+                        "arguments": '{"path": "README.md"}',
+                    },
+                }
+            ],
+        )
+
+    def test_raw_chat_completion_maps_model_json_tool_call_to_openai_tool_call(self):
+        try:
+            from fastapi.testclient import TestClient
+        except Exception as exc:
+            self.skipTest(f"FastAPI TestClient unavailable: {exc}")
+
+        import internal_agent.server.openai_compat as compat
+
+        class FakeLLM:
+            def __init__(self):
+                self.system_prompt = None
+
+            def complete(self, prompt, *, system_prompt=None):
+                self.system_prompt = system_prompt
+                return '{"type":"tool_call","name":"read","arguments":{"path":"README.md"}}'
+
+        fake_llm = FakeLLM()
+        original_llm = compat._raw_llm
+        compat._raw_llm = fake_llm
+        try:
+            client = TestClient(compat.app)
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "kingogpt-web",
+                    "messages": [{"role": "user", "content": "read the file"}],
+                    "tools": [
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "read",
+                                "parameters": {"type": "object"},
+                            },
+                        }
+                    ],
+                },
+            )
+            self.assertEqual(response.status_code, 200)
+            payload = response.json()
+            choice = payload["choices"][0]
+            self.assertEqual(choice["finish_reason"], "tool_calls")
+            self.assertIsNone(choice["message"]["content"])
+            self.assertEqual(
+                choice["message"]["tool_calls"][0]["function"]["name"],
+                "read",
+            )
+            self.assertIn("AVAILABLE TOOLS", fake_llm.system_prompt)
+        finally:
+            compat._raw_llm = original_llm
+
     def test_raw_chat_completion_endpoint_with_mock_llm(self):
         try:
             from fastapi.testclient import TestClient
@@ -395,6 +526,49 @@ class AzureWebLLMTests(unittest.TestCase):
         finally:
             compat._raw_llm = original_llm
 
+    def test_responses_endpoint_accepts_input_text_blocks(self):
+        try:
+            from fastapi.testclient import TestClient
+        except Exception as exc:
+            self.skipTest(f"FastAPI TestClient unavailable: {exc}")
+
+        import internal_agent.server.openai_compat as compat
+
+        class FakeLLM:
+            def __init__(self):
+                self.prompt = None
+
+            def complete(self, prompt, *, system_prompt=None):
+                self.prompt = prompt
+                return "block ok"
+
+        fake_llm = FakeLLM()
+        original_llm = compat._raw_llm
+        compat._raw_llm = fake_llm
+        try:
+            client = TestClient(compat.app)
+            response = client.post(
+                "/v1/responses",
+                json={
+                    "model": "kingogpt-web",
+                    "input": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "input_text", "text": "hello from hermes"},
+                            ],
+                        },
+                    ],
+                },
+            )
+            self.assertEqual(response.status_code, 200)
+            payload = response.json()
+            self.assertEqual(payload["output_text"], "block ok")
+            self.assertIn("hello from hermes", fake_llm.prompt)
+            self.assertEqual(payload["usage"]["output_tokens"], 2)
+        finally:
+            compat._raw_llm = original_llm
+
     def test_raw_chat_completion_streaming_smoke(self):
         try:
             from fastapi.testclient import TestClient
@@ -443,6 +617,92 @@ class AzureWebLLMTests(unittest.TestCase):
         finally:
             compat._raw_llm = original_llm
 
+    def test_raw_chat_completion_streaming_can_include_usage(self):
+        try:
+            from fastapi.testclient import TestClient
+        except Exception as exc:
+            self.skipTest(f"FastAPI TestClient unavailable: {exc}")
+
+        import internal_agent.server.openai_compat as compat
+
+        class FakeLLM:
+            def complete(self, prompt, *, system_prompt=None):
+                return "stream usage ok"
+
+        original_llm = compat._raw_llm
+        compat._raw_llm = FakeLLM()
+        try:
+            client = TestClient(compat.app)
+            with client.stream(
+                "POST",
+                "/v1/chat/completions",
+                json={
+                    "model": "kingogpt-web",
+                    "stream": True,
+                    "stream_options": {"include_usage": True},
+                    "messages": [{"role": "user", "content": "hello"}],
+                },
+            ) as response:
+                self.assertEqual(response.status_code, 200)
+                body = "".join(response.iter_text())
+
+            data_lines = [
+                line.removeprefix("data: ")
+                for line in body.splitlines()
+                if line.startswith("data: ") and line != "data: [DONE]"
+            ]
+            chunks = [json.loads(line) for line in data_lines]
+            usage_chunks = [chunk for chunk in chunks if chunk.get("usage")]
+            self.assertEqual(usage_chunks[0]["choices"], [])
+            self.assertGreater(usage_chunks[0]["usage"]["total_tokens"], 0)
+        finally:
+            compat._raw_llm = original_llm
+
+    def test_raw_chat_completion_streams_tool_call(self):
+        try:
+            from fastapi.testclient import TestClient
+        except Exception as exc:
+            self.skipTest(f"FastAPI TestClient unavailable: {exc}")
+
+        import internal_agent.server.openai_compat as compat
+
+        client = TestClient(compat.app)
+        with client.stream(
+            "POST",
+            "/v1/chat/completions",
+            json={
+                "model": "kingogpt-web",
+                "stream": True,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": "Use your available tools to inspect the current working directory.",
+                    }
+                ],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "search_files",
+                            "parameters": {"type": "object"},
+                        },
+                    }
+                ],
+            },
+        ) as response:
+            self.assertEqual(response.status_code, 200)
+            body = "".join(response.iter_text())
+
+        data_lines = [
+            line.removeprefix("data: ")
+            for line in body.splitlines()
+            if line.startswith("data: ") and line != "data: [DONE]"
+        ]
+        chunks = [json.loads(line) for line in data_lines]
+        self.assertEqual(chunks[-1]["choices"][0]["finish_reason"], "tool_calls")
+        tool_call_delta = chunks[1]["choices"][0]["delta"]["tool_calls"][0]
+        self.assertEqual(tool_call_delta["function"]["name"], "search_files")
+
     def test_raw_chat_completion_accepts_extra_openai_fields(self):
         try:
             from fastapi.testclient import TestClient
@@ -489,6 +749,94 @@ class AzureWebLLMTests(unittest.TestCase):
             )
         finally:
             compat._raw_llm = original_llm
+
+    def test_raw_chat_completion_returns_tool_call_for_directory_inspection(self):
+        try:
+            from fastapi.testclient import TestClient
+        except Exception as exc:
+            self.skipTest(f"FastAPI TestClient unavailable: {exc}")
+
+        import internal_agent.server.openai_compat as compat
+
+        client = TestClient(compat.app)
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "kingogpt-web",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": "Use your available tools to inspect the current working directory.",
+                    }
+                ],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "search_files",
+                            "parameters": {"type": "object"},
+                        },
+                    }
+                ],
+                "tool_choice": "auto",
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        choice = payload["choices"][0]
+        self.assertEqual(choice["finish_reason"], "tool_calls")
+        tool_call = choice["message"]["tool_calls"][0]
+        self.assertEqual(tool_call["function"]["name"], "search_files")
+        self.assertIn('"target": "files"', tool_call["function"]["arguments"])
+
+    def test_raw_chat_completion_finishes_tool_smoke_after_tool_result(self):
+        try:
+            from fastapi.testclient import TestClient
+        except Exception as exc:
+            self.skipTest(f"FastAPI TestClient unavailable: {exc}")
+
+        import internal_agent.server.openai_compat as compat
+
+        client = TestClient(compat.app)
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "kingogpt-web",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": (
+                            "Use your available tools to inspect the current working "
+                            "directory, then answer with TOOL_SMOKE_OK."
+                        ),
+                    },
+                    {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": "call_kingogpt_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "search_files",
+                                    "arguments": "{}",
+                                },
+                            }
+                        ],
+                    },
+                    {
+                        "role": "tool",
+                        "tool_call_id": "call_kingogpt_1",
+                        "content": "scripts/hermes_tool_smoke.py\nDockerfile",
+                    },
+                ],
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.json()["choices"][0]["message"]["content"],
+            "TOOL_SMOKE_OK hermes_tool_smoke.py",
+        )
 
     def test_health_endpoint(self):
         try:

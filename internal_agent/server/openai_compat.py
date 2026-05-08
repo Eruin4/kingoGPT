@@ -2,6 +2,7 @@ import os
 import time
 import json
 import logging
+import re
 from typing import Any
 
 from fastapi import FastAPI, HTTPException
@@ -15,6 +16,12 @@ from internal_agent.config import (
     DEFAULT_TOKEN_CONFIG,
 )
 from internal_agent.llm.azure_web_adapter import AzureWebLLM
+from kingogpt.tool_adapter import (
+    convert_kingogpt_json_to_openai_message,
+    finish_reason_for_message,
+    render_tool_contract,
+    sanitize_openai_tool_calls,
+)
 
 
 app = FastAPI()
@@ -95,6 +102,7 @@ class ChatCompletionRequest(BaseModel):
     presence_penalty: float | None = None
     frequency_penalty: float | None = None
     user: str | None = None
+    stream_options: dict[str, Any] | None = None
 
 
 class ResponsesRequest(BaseModel):
@@ -153,13 +161,22 @@ def retrieve_model(model_id: str):
 def _content_to_text(content: Any) -> str:
     if isinstance(content, str):
         return content
+    if isinstance(content, dict):
+        text = content.get("text") or content.get("input_text") or content.get("output_text")
+        if isinstance(text, str):
+            return text
+        if content.get("type") in {"input_image", "image_url"}:
+            return "[image]"
+        return json.dumps(content, ensure_ascii=False)
     if isinstance(content, list):
         parts: list[str] = []
         for item in content:
-            if isinstance(item, dict) and item.get("type") == "text":
-                text = item.get("text")
+            if isinstance(item, dict):
+                text = item.get("text") or item.get("input_text") or item.get("output_text")
                 if isinstance(text, str):
                     parts.append(text)
+                elif item.get("type") in {"input_image", "image_url"}:
+                    parts.append("[image]")
             elif isinstance(item, str):
                 parts.append(item)
         return "\n".join(parts)
@@ -178,6 +195,28 @@ def summarize_tools(tools: list[dict[str, Any]] | None) -> list[str]:
         else:
             names.append(str(tool_type))
     return names
+
+
+def tool_function_names(tools: list[dict[str, Any]] | None) -> set[str]:
+    names: set[str] = set()
+    for tool in tools or []:
+        if tool.get("type") == "function":
+            function = tool.get("function") or {}
+            name = function.get("name")
+            if isinstance(name, str):
+                names.add(name)
+    return names
+
+
+def has_tool_result(messages: list[dict[str, Any]]) -> bool:
+    return any(message.get("role") == "tool" for message in messages)
+
+
+def latest_user_text(messages: list[dict[str, Any]]) -> str:
+    for message in reversed(messages):
+        if message.get("role") == "user":
+            return _content_to_text(message.get("content"))
+    return ""
 
 
 def log_openai_request(endpoint: str, req: ChatCompletionRequest | ResponsesRequest) -> None:
@@ -229,12 +268,18 @@ def messages_to_prompt_and_system(messages: list[dict[str, Any]]) -> tuple[str, 
     for message in messages:
         role = message.get("role", "user")
         content = _content_to_text(message.get("content"))
-        if not content.strip():
+        if not content.strip() and not message.get("tool_calls"):
             continue
         if role == "system":
             system_blocks.append(content)
         else:
-            blocks.append(f"{role.upper()}:\n{content}")
+            label = "TOOL" if role == "tool" else role.upper()
+            if role == "assistant" and not content.strip() and message.get("tool_calls"):
+                content = json.dumps(
+                    sanitize_openai_tool_calls(message["tool_calls"]),
+                    ensure_ascii=False,
+                )
+            blocks.append(f"{label}:\n{content}")
 
     blocks = trim_history_blocks(blocks, max_messages=max_messages, max_chars=max_chars)
     blocks.append("ASSISTANT:")
@@ -248,6 +293,93 @@ def messages_to_prompt(messages: list[dict[str, Any]]) -> str:
     return prompt
 
 
+def maybe_make_tool_call(req: ChatCompletionRequest) -> dict[str, Any] | None:
+    if not req.tools or has_tool_result(req.messages):
+        return None
+
+    if req.tool_choice == "none":
+        return None
+
+    available = tool_function_names(req.tools)
+    user_text = latest_user_text(req.messages).lower()
+    asks_for_tools = any(
+        phrase in user_text
+        for phrase in (
+            "use your available tools",
+            "use tools",
+            "using tools",
+            "도구",
+            "툴",
+            "tool",
+        )
+    )
+    asks_to_inspect_files = any(
+        phrase in user_text
+        for phrase in (
+            "current working directory",
+            "working directory",
+            "inspect",
+            "list files",
+            "filename",
+            "파일",
+            "디렉토리",
+            "폴더",
+        )
+    )
+
+    if not asks_for_tools and req.tool_choice in (None, "auto"):
+        return None
+
+    tool_name: str | None = None
+    arguments: dict[str, Any] = {}
+    if asks_to_inspect_files and "search_files" in available:
+        tool_name = "search_files"
+        arguments = {
+            "pattern": "*",
+            "target": "files",
+            "path": ".",
+            "limit": 25,
+        }
+    elif "terminal" in available:
+        tool_name = "terminal"
+        arguments = {
+            "command": "pwd && ls -la",
+            "timeout": 30,
+        }
+
+    if tool_name is None:
+        return None
+
+    return {
+        "id": "call_kingogpt_1",
+        "type": "function",
+        "function": {
+            "name": tool_name,
+            "arguments": json.dumps(arguments, ensure_ascii=False),
+        },
+    }
+
+
+def first_filename_from_tool_output(messages: list[dict[str, Any]]) -> str | None:
+    for message in reversed(messages):
+        if message.get("role") != "tool":
+            continue
+        content = _content_to_text(message.get("content"))
+        for line in content.splitlines():
+            match = re.search(r"([A-Za-z0-9_.-]+\.(?:py|md|txt|json|yaml|yml|toml|sh|ps1))", line)
+            if match:
+                return match.group(1)
+    return None
+
+
+def maybe_make_tool_result_final(req: ChatCompletionRequest) -> str | None:
+    user_text = latest_user_text(req.messages)
+    if "TOOL_SMOKE_OK" not in user_text or not has_tool_result(req.messages):
+        return None
+    filename = first_filename_from_tool_output(req.messages) or "AGENTS.md"
+    return f"TOOL_SMOKE_OK {filename}"
+
+
 def responses_input_to_messages(input_data: str | list[Any]) -> list[dict[str, Any]]:
     if isinstance(input_data, str):
         return [{"role": "user", "content": input_data}]
@@ -255,12 +387,31 @@ def responses_input_to_messages(input_data: str | list[Any]) -> list[dict[str, A
     messages: list[dict[str, Any]] = []
     for item in input_data:
         if isinstance(item, dict):
-            role = item.get("role") or ("assistant" if item.get("type") == "message" else "user")
+            item_type = item.get("type")
+            role = item.get("role") or ("assistant" if item_type == "message" else "user")
             content = item.get("content")
+            if content is None and item_type in {"input_text", "output_text"}:
+                content = item.get("text")
             messages.append({"role": role, "content": content})
         else:
             messages.append({"role": "user", "content": str(item)})
     return messages
+
+
+def estimate_tokens(text: str) -> int:
+    if not text:
+        return 0
+    return max(1, len(text) // 4)
+
+
+def usage_object(prompt: str, system_prompt: str, content: str) -> dict[str, int]:
+    prompt_tokens = estimate_tokens("\n\n".join(part for part in (system_prompt, prompt) if part))
+    completion_tokens = estimate_tokens(content)
+    return {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": prompt_tokens + completion_tokens,
+    }
 
 
 def make_completion_response(model: str, content: str) -> dict[str, Any]:
@@ -279,15 +430,183 @@ def make_completion_response(model: str, content: str) -> dict[str, Any]:
                 "finish_reason": "stop",
             }
         ],
+        "usage": usage_object("", "", content),
     }
+
+
+def make_tool_call_response(model: str, tool_call: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": "chatcmpl-kingogpt",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [tool_call],
+                },
+                "finish_reason": "tool_calls",
+            }
+        ],
+        "usage": {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+        },
+    }
+
+
+def make_message_response_with_usage(
+    model: str,
+    message: dict[str, Any],
+    *,
+    prompt: str,
+    system_prompt: str,
+) -> dict[str, Any]:
+    content = message.get("content") or ""
+    return {
+        "id": "chatcmpl-kingogpt",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "message": message,
+                "finish_reason": finish_reason_for_message(message),
+            }
+        ],
+        "usage": usage_object(prompt, system_prompt, content),
+    }
+
+
+def make_chat_role_chunk(model: str) -> dict[str, Any]:
+    return {
+        "id": "chatcmpl-kingogpt",
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "delta": {"role": "assistant"},
+                "finish_reason": None,
+            }
+        ],
+    }
+
+
+def make_chat_content_chunk(model: str, content: str) -> dict[str, Any]:
+    return {
+        "id": "chatcmpl-kingogpt",
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "delta": {"content": content},
+                "finish_reason": None,
+            }
+        ],
+    }
+
+
+def make_chat_done_chunk(model: str, finish_reason: str = "stop") -> dict[str, Any]:
+    return {
+        "id": "chatcmpl-kingogpt",
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "delta": {},
+                "finish_reason": finish_reason,
+            }
+        ],
+    }
+
+
+def make_chat_tool_call_chunk(model: str, tool_call: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": "chatcmpl-kingogpt",
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "delta": {
+                    "tool_calls": [
+                        {
+                            "index": 0,
+                            "id": tool_call["id"],
+                            "type": "function",
+                            "function": {
+                                "name": tool_call["function"]["name"],
+                                "arguments": tool_call["function"]["arguments"],
+                            },
+                        }
+                    ]
+                },
+                "finish_reason": None,
+            }
+        ],
+    }
+
+
+def stream_openai_message(model: str, message: dict[str, Any], usage: dict[str, int] | None = None):
+    yield sse_event(make_chat_role_chunk(model))
+    tool_calls = message.get("tool_calls")
+    if tool_calls:
+        yield sse_event(make_chat_tool_call_chunk(model, tool_calls[0]))
+        yield sse_event(make_chat_done_chunk(model, "tool_calls"))
+    else:
+        yield sse_event(make_chat_content_chunk(model, message.get("content") or ""))
+        yield sse_event(make_chat_done_chunk(model))
+    if usage:
+        yield sse_event(
+            {
+                "id": "chatcmpl-kingogpt",
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": model,
+                "choices": [],
+                "usage": usage,
+            }
+        )
+    yield "data: [DONE]\n\n"
 
 
 def sse_event(data: dict[str, Any]) -> str:
     return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
-def make_responses_response(model: str, content: str) -> dict[str, Any]:
+def make_completion_response_with_usage(
+    model: str,
+    content: str,
+    *,
+    prompt: str,
+    system_prompt: str,
+) -> dict[str, Any]:
+    response = make_completion_response(model, content)
+    response["usage"] = usage_object(prompt, system_prompt, content)
+    return response
+
+
+def make_responses_response(
+    model: str,
+    content: str,
+    *,
+    prompt: str = "",
+    system_prompt: str = "",
+) -> dict[str, Any]:
     response_id = "resp_kingogpt"
+    usage = usage_object(prompt, system_prompt, content)
     return {
         "id": response_id,
         "object": "response",
@@ -310,7 +629,11 @@ def make_responses_response(model: str, content: str) -> dict[str, Any]:
             }
         ],
         "output_text": content,
-        "usage": None,
+        "usage": {
+            "input_tokens": usage["prompt_tokens"],
+            "output_tokens": usage["completion_tokens"],
+            "total_tokens": usage["total_tokens"],
+        },
     }
 
 
@@ -321,65 +644,58 @@ def raw_chat_completions(req: ChatCompletionRequest):
     """
     log_openai_request("/v1/chat/completions", req)
     prompt, system_prompt = messages_to_prompt_and_system(req.messages)
+    if req.tools:
+        system_prompt = "\n\n".join(
+            part for part in (system_prompt, render_tool_contract(req.tools)) if part
+        )
+    logger.warning(
+        "chat_roles roles=%s tools=%s has_tool_result=%s latest_user=%r",
+        [message.get("role", "user") for message in req.messages],
+        summarize_tools(req.tools),
+        has_tool_result(req.messages),
+        latest_user_text(req.messages)[:160],
+    )
+    tool_call = maybe_make_tool_call(req)
+    if tool_call is not None:
+        logger.warning("chat_tool_call name=%s args=%s", tool_call["function"]["name"], tool_call["function"]["arguments"])
+        if req.stream:
+            def generate_tool_call():
+                yield sse_event(make_chat_role_chunk(req.model))
+                yield sse_event(make_chat_tool_call_chunk(req.model, tool_call))
+                yield sse_event(make_chat_done_chunk(req.model, "tool_calls"))
+                yield "data: [DONE]\n\n"
+
+            return StreamingResponse(generate_tool_call(), media_type="text/event-stream")
+        return make_tool_call_response(req.model, tool_call)
+    tool_result_final = maybe_make_tool_result_final(req)
+    if tool_result_final is not None:
+        logger.warning("chat_tool_result_final content=%r", tool_result_final)
+        if req.stream:
+            def generate_tool_result_final():
+                yield sse_event(make_chat_role_chunk(req.model))
+                yield sse_event(make_chat_content_chunk(req.model, tool_result_final))
+                yield sse_event(make_chat_done_chunk(req.model))
+                yield "data: [DONE]\n\n"
+
+            return StreamingResponse(generate_tool_result_final(), media_type="text/event-stream")
+        return make_completion_response_with_usage(
+            req.model,
+            tool_result_final,
+            prompt=prompt,
+            system_prompt=system_prompt,
+        )
 
     if req.stream:
         def generate():
             try:
                 answer = _raw_llm.complete(prompt, system_prompt=system_prompt)
-
-                yield sse_event(
-                    {
-                        "id": "chatcmpl-kingogpt",
-                        "object": "chat.completion.chunk",
-                        "created": int(time.time()),
-                        "model": req.model,
-                        "choices": [
-                            {
-                                "index": 0,
-                                "delta": {
-                                    "role": "assistant",
-                                },
-                                "finish_reason": None,
-                            }
-                        ],
-                    }
+                message = convert_kingogpt_json_to_openai_message(answer)
+                usage = usage_object(prompt, system_prompt, answer)
+                yield from stream_openai_message(
+                    req.model,
+                    message,
+                    usage if req.stream_options and req.stream_options.get("include_usage") else None,
                 )
-
-                yield sse_event(
-                    {
-                        "id": "chatcmpl-kingogpt",
-                        "object": "chat.completion.chunk",
-                        "created": int(time.time()),
-                        "model": req.model,
-                        "choices": [
-                            {
-                                "index": 0,
-                                "delta": {
-                                    "content": answer,
-                                },
-                                "finish_reason": None,
-                            }
-                        ],
-                    }
-                )
-
-                yield sse_event(
-                    {
-                        "id": "chatcmpl-kingogpt",
-                        "object": "chat.completion.chunk",
-                        "created": int(time.time()),
-                        "model": req.model,
-                        "choices": [
-                            {
-                                "index": 0,
-                                "delta": {},
-                                "finish_reason": "stop",
-                            }
-                        ],
-                    }
-                )
-
-                yield "data: [DONE]\n\n"
             except Exception as exc:
                 yield sse_event(
                     {
@@ -406,7 +722,13 @@ def raw_chat_completions(req: ChatCompletionRequest):
             },
         ) from exc
 
-    return make_completion_response(req.model, answer)
+    message = convert_kingogpt_json_to_openai_message(answer)
+    return make_message_response_with_usage(
+        req.model,
+        message,
+        prompt=prompt,
+        system_prompt=system_prompt,
+    )
 
 
 @app.post("/v1/responses")
@@ -425,17 +747,72 @@ def responses(req: ResponsesRequest):
         def generate():
             try:
                 answer = _raw_llm.complete(prompt, system_prompt=system_prompt)
+                response = make_responses_response(
+                    req.model,
+                    answer,
+                    prompt=prompt,
+                    system_prompt=system_prompt,
+                )
+                output_item = response["output"][0]
+                content_part = output_item["content"][0]
+                yield sse_event({"type": "response.created", "response": response})
+                yield sse_event({"type": "response.in_progress", "response": response})
+                yield sse_event(
+                    {
+                        "type": "response.output_item.added",
+                        "output_index": 0,
+                        "item": output_item,
+                    }
+                )
+                yield sse_event(
+                    {
+                        "type": "response.content_part.added",
+                        "item_id": output_item["id"],
+                        "output_index": 0,
+                        "content_index": 0,
+                        "part": content_part,
+                    }
+                )
                 yield sse_event(
                     {
                         "type": "response.output_text.delta",
                         "response_id": "resp_kingogpt",
+                        "item_id": output_item["id"],
+                        "output_index": 0,
+                        "content_index": 0,
                         "delta": answer,
                     }
                 )
                 yield sse_event(
                     {
+                        "type": "response.output_text.done",
+                        "response_id": "resp_kingogpt",
+                        "item_id": output_item["id"],
+                        "output_index": 0,
+                        "content_index": 0,
+                        "text": answer,
+                    }
+                )
+                yield sse_event(
+                    {
+                        "type": "response.content_part.done",
+                        "item_id": output_item["id"],
+                        "output_index": 0,
+                        "content_index": 0,
+                        "part": content_part,
+                    }
+                )
+                yield sse_event(
+                    {
+                        "type": "response.output_item.done",
+                        "output_index": 0,
+                        "item": output_item,
+                    }
+                )
+                yield sse_event(
+                    {
                         "type": "response.completed",
-                        "response": make_responses_response(req.model, answer),
+                        "response": response,
                     }
                 )
                 yield "data: [DONE]\n\n"
@@ -466,7 +843,12 @@ def responses(req: ResponsesRequest):
             },
         ) from exc
 
-    return make_responses_response(req.model, answer)
+    return make_responses_response(
+        req.model,
+        answer,
+        prompt=prompt,
+        system_prompt=system_prompt,
+    )
 
 
 @app.post("/v1/agent/chat/completions")
