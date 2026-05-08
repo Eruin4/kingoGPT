@@ -218,7 +218,7 @@ class OpenAICompatTests(unittest.TestCase):
                 choice["message"]["tool_calls"][0]["function"]["name"],
                 "read",
             )
-            self.assertIn("AVAILABLE TOOLS", fake_llm.system_prompt)
+            self.assertIn("CLIENT TOOL CATALOG", fake_llm.system_prompt)
         finally:
             compat._raw_llm = original_llm
 
@@ -666,32 +666,44 @@ class AzureWebLLMTests(unittest.TestCase):
 
         import internal_agent.server.openai_compat as compat
 
-        client = TestClient(compat.app)
-        with client.stream(
-            "POST",
-            "/v1/chat/completions",
-            json={
-                "model": "kingogpt-web",
-                "stream": True,
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": "Use your available tools to inspect the current working directory.",
-                    }
-                ],
-                "tools": [
-                    {
-                        "type": "function",
-                        "function": {
-                            "name": "search_files",
-                            "parameters": {"type": "object"},
-                        },
-                    }
-                ],
-            },
-        ) as response:
-            self.assertEqual(response.status_code, 200)
-            body = "".join(response.iter_text())
+        class FakeLLM:
+            def complete(self, prompt, *, system_prompt=None):
+                return (
+                    '{"type":"tool_call","name":"search_files",'
+                    '"arguments":{"pattern":"*","target":"files","path":".","limit":25}}'
+                )
+
+        original_llm = compat._raw_llm
+        compat._raw_llm = FakeLLM()
+        try:
+            client = TestClient(compat.app)
+            with client.stream(
+                "POST",
+                "/v1/chat/completions",
+                json={
+                    "model": "kingogpt-web",
+                    "stream": True,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": "Use your available tools to inspect the current working directory.",
+                        }
+                    ],
+                    "tools": [
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "search_files",
+                                "parameters": {"type": "object"},
+                            },
+                        }
+                    ],
+                },
+            ) as response:
+                self.assertEqual(response.status_code, 200)
+                body = "".join(response.iter_text())
+        finally:
+            compat._raw_llm = original_llm
 
         data_lines = [
             line.removeprefix("data: ")
@@ -758,36 +770,471 @@ class AzureWebLLMTests(unittest.TestCase):
 
         import internal_agent.server.openai_compat as compat
 
-        client = TestClient(compat.app)
-        response = client.post(
-            "/v1/chat/completions",
-            json={
-                "model": "kingogpt-web",
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": "Use your available tools to inspect the current working directory.",
-                    }
-                ],
-                "tools": [
-                    {
-                        "type": "function",
-                        "function": {
-                            "name": "search_files",
-                            "parameters": {"type": "object"},
-                        },
-                    }
-                ],
-                "tool_choice": "auto",
-            },
-        )
-        self.assertEqual(response.status_code, 200)
-        payload = response.json()
+        class FakeLLM:
+            def complete(self, prompt, *, system_prompt=None):
+                return (
+                    '{"type":"tool_call","name":"search_files",'
+                    '"arguments":{"pattern":"*","target":"files","path":".","limit":25}}'
+                )
+
+        original_llm = compat._raw_llm
+        compat._raw_llm = FakeLLM()
+        try:
+            client = TestClient(compat.app)
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "kingogpt-web",
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": "Use your available tools to inspect the current working directory.",
+                        }
+                    ],
+                    "tools": [
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "search_files",
+                                "parameters": {"type": "object"},
+                            },
+                        }
+                    ],
+                    "tool_choice": "auto",
+                },
+            )
+            self.assertEqual(response.status_code, 200)
+            payload = response.json()
+        finally:
+            compat._raw_llm = original_llm
         choice = payload["choices"][0]
         self.assertEqual(choice["finish_reason"], "tool_calls")
         tool_call = choice["message"]["tool_calls"][0]
         self.assertEqual(tool_call["function"]["name"], "search_files")
         self.assertIn('"target": "files"', tool_call["function"]["arguments"])
+
+    def test_raw_chat_completion_shallow_prompt_does_not_fabricate_tool_call(self):
+        try:
+            from fastapi.testclient import TestClient
+        except Exception as exc:
+            self.skipTest(f"FastAPI TestClient unavailable: {exc}")
+
+        import internal_agent.server.openai_compat as compat
+
+        class FakeLLM:
+            def complete(self, prompt, *, system_prompt=None):
+                return "4"
+
+        original_llm = compat._raw_llm
+        compat._raw_llm = FakeLLM()
+        try:
+            client = TestClient(compat.app)
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "kingogpt-web",
+                    "stream": False,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": (
+                                "You have tools available if they are genuinely needed, "
+                                "but answer directly when you can. What is 2 + 2?"
+                            ),
+                        }
+                    ],
+                    "tools": [
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "terminal",
+                                "description": "Run a shell command.",
+                                "parameters": {
+                                    "type": "object",
+                                    "properties": {
+                                        "command": {"type": "string"},
+                                        "timeout": {"type": "integer"},
+                                    },
+                                    "required": ["command"],
+                                },
+                            },
+                        }
+                    ],
+                    "tool_choice": "auto",
+                },
+            )
+        finally:
+            compat._raw_llm = original_llm
+
+        self.assertEqual(response.status_code, 200)
+        choice = response.json()["choices"][0]
+        self.assertEqual(choice["finish_reason"], "stop")
+        self.assertEqual(choice["message"], {"role": "assistant", "content": "4"})
+
+    def test_raw_chat_completion_tolerates_non_object_message_and_tool_items(self):
+        try:
+            from fastapi.testclient import TestClient
+        except Exception as exc:
+            self.skipTest(f"FastAPI TestClient unavailable: {exc}")
+
+        import internal_agent.server.openai_compat as compat
+
+        class FakeLLM:
+            def __init__(self):
+                self.prompt = None
+
+            def complete(self, prompt, *, system_prompt=None):
+                self.prompt = prompt
+                return "ok"
+
+        fake_llm = FakeLLM()
+        original_llm = compat._raw_llm
+        compat._raw_llm = fake_llm
+        try:
+            client = TestClient(compat.app)
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "kingogpt-web",
+                    "messages": ["hello from fallback client"],
+                    "tools": [
+                        "terminal",
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "terminal",
+                                "parameters": {"type": "object"},
+                            },
+                        },
+                    ],
+                },
+            )
+        finally:
+            compat._raw_llm = original_llm
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["choices"][0]["message"]["content"], "ok")
+        self.assertIn("hello from fallback client", fake_llm.prompt)
+
+    def test_raw_chat_completion_required_tool_choice_does_not_fabricate_tool_call(self):
+        try:
+            from fastapi.testclient import TestClient
+        except Exception as exc:
+            self.skipTest(f"FastAPI TestClient unavailable: {exc}")
+
+        import internal_agent.server.openai_compat as compat
+
+        class FakeLLM:
+            def __init__(self):
+                self.prompt = None
+
+            def complete(self, prompt, *, system_prompt=None):
+                self.prompt = prompt
+                return "model chose not to call a tool"
+
+        fake_llm = FakeLLM()
+        original_llm = compat._raw_llm
+        compat._raw_llm = fake_llm
+        try:
+            client = TestClient(compat.app)
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "kingogpt-web",
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": "Use your available tools to list the current working directory.",
+                        }
+                    ],
+                    "tools": [
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "terminal",
+                                "description": "Run a shell command.",
+                                "parameters": {
+                                    "type": "object",
+                                    "properties": {
+                                        "command": {"type": "string"},
+                                    },
+                                    "required": ["command"],
+                                },
+                            },
+                        }
+                    ],
+                    "tool_choice": "required",
+                },
+            )
+        finally:
+            compat._raw_llm = original_llm
+
+        self.assertEqual(response.status_code, 200)
+        choice = response.json()["choices"][0]
+        self.assertEqual(choice["finish_reason"], "stop")
+        self.assertNotIn("tool_calls", choice["message"])
+        self.assertEqual(choice["message"]["content"], "model chose not to call a tool")
+        self.assertIn("TOOL GUIDANCE", fake_llm.prompt)
+
+    def test_raw_chat_completion_repairs_invalid_attempted_tool_call_json(self):
+        try:
+            from fastapi.testclient import TestClient
+        except Exception as exc:
+            self.skipTest(f"FastAPI TestClient unavailable: {exc}")
+
+        import internal_agent.server.openai_compat as compat
+
+        class FakeLLM:
+            def __init__(self):
+                self.prompts = []
+
+            def complete(self, prompt, *, system_prompt=None):
+                self.prompts.append(prompt)
+                if len(self.prompts) == 1:
+                    return '{"type":"tool_call","name":"terminal","arguments":{}}'
+                return (
+                    '{"type":"tool_call","name":"terminal",'
+                    '"arguments":{"command":"pwd && ls -la","timeout":30}}'
+                )
+
+        fake_llm = FakeLLM()
+        original_llm = compat._raw_llm
+        compat._raw_llm = fake_llm
+        try:
+            client = TestClient(compat.app)
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "kingogpt-web",
+                    "stream": False,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": "Use your available tools to list the current working directory.",
+                        }
+                    ],
+                    "tools": [
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "terminal",
+                                "description": "Run a shell command.",
+                                "parameters": {
+                                    "type": "object",
+                                    "properties": {
+                                        "command": {"type": "string"},
+                                        "timeout": {"type": "integer"},
+                                    },
+                                    "required": ["command"],
+                                },
+                            },
+                        }
+                    ],
+                    "tool_choice": "auto",
+                },
+            )
+        finally:
+            compat._raw_llm = original_llm
+
+        self.assertEqual(response.status_code, 200)
+        choice = response.json()["choices"][0]
+        self.assertEqual(choice["finish_reason"], "tool_calls")
+        self.assertIsNone(choice["message"]["content"])
+        tool_call = choice["message"]["tool_calls"][0]
+        self.assertEqual(tool_call["function"]["name"], "terminal")
+        self.assertEqual(len(fake_llm.prompts), 2)
+        self.assertIn("could not be converted", fake_llm.prompts[1])
+
+    def test_raw_chat_completion_repairs_markdown_tool_substitute(self):
+        try:
+            from fastapi.testclient import TestClient
+        except Exception as exc:
+            self.skipTest(f"FastAPI TestClient unavailable: {exc}")
+
+        import internal_agent.server.openai_compat as compat
+
+        class FakeLLM:
+            def __init__(self):
+                self.prompts = []
+
+            def complete(self, prompt, *, system_prompt=None):
+                self.prompts.append(prompt)
+                if len(self.prompts) == 1:
+                    return "```python\nimport os\nos.getcwd()\n```\n<!-- tools: python -->"
+                return (
+                    '{"type":"tool_call","name":"terminal",'
+                    '"arguments":{"command":"pwd","timeout":30}}'
+                )
+
+        fake_llm = FakeLLM()
+        original_llm = compat._raw_llm
+        compat._raw_llm = fake_llm
+        try:
+            client = TestClient(compat.app)
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "kingogpt-web",
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": "What is the current working directory?",
+                        }
+                    ],
+                    "tools": [
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "terminal",
+                                "description": "Run a shell command.",
+                                "parameters": {
+                                    "type": "object",
+                                    "properties": {
+                                        "command": {"type": "string"},
+                                        "timeout": {"type": "integer"},
+                                    },
+                                    "required": ["command"],
+                                },
+                            },
+                        }
+                    ],
+                    "tool_choice": "auto",
+                },
+            )
+        finally:
+            compat._raw_llm = original_llm
+
+        self.assertEqual(response.status_code, 200)
+        choice = response.json()["choices"][0]
+        self.assertEqual(choice["finish_reason"], "tool_calls")
+        self.assertEqual(len(fake_llm.prompts), 2)
+        self.assertIn("hidden comments instead of a tool_call", fake_llm.prompts[1])
+
+    def test_raw_chat_completion_repairs_internal_tool_error_substitute(self):
+        try:
+            from fastapi.testclient import TestClient
+        except Exception as exc:
+            self.skipTest(f"FastAPI TestClient unavailable: {exc}")
+
+        import internal_agent.server.openai_compat as compat
+
+        class FakeLLM:
+            def __init__(self):
+                self.prompts = []
+
+            def complete(self, prompt, *, system_prompt=None):
+                self.prompts.append(prompt)
+                if len(self.prompts) == 1:
+                    return '"failed to execute \'@list_sort\' argument is not array"'
+                return (
+                    '{"type":"tool_call","name":"terminal",'
+                    '"arguments":{"command":"pwd","timeout":30}}'
+                )
+
+        fake_llm = FakeLLM()
+        original_llm = compat._raw_llm
+        compat._raw_llm = fake_llm
+        try:
+            client = TestClient(compat.app)
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "kingogpt-web",
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": "What is the current working directory?",
+                        }
+                    ],
+                    "tools": [
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "terminal",
+                                "description": "Run a shell command.",
+                                "parameters": {
+                                    "type": "object",
+                                    "properties": {
+                                        "command": {"type": "string"},
+                                        "timeout": {"type": "integer"},
+                                    },
+                                    "required": ["command"],
+                                },
+                            },
+                        }
+                    ],
+                },
+            )
+        finally:
+            compat._raw_llm = original_llm
+
+        self.assertEqual(response.status_code, 200)
+        choice = response.json()["choices"][0]
+        self.assertEqual(choice["finish_reason"], "tool_calls")
+        self.assertIn("internal at-sign tool syntax", fake_llm.prompts[1])
+
+    def test_raw_chat_completion_uses_focused_serialization_repair(self):
+        try:
+            from fastapi.testclient import TestClient
+        except Exception as exc:
+            self.skipTest(f"FastAPI TestClient unavailable: {exc}")
+
+        import internal_agent.server.openai_compat as compat
+
+        class FakeLLM:
+            def __init__(self):
+                self.prompts = []
+
+            def complete(self, prompt, *, system_prompt=None):
+                self.prompts.append(prompt)
+                if len(self.prompts) < 3:
+                    return '"failed to execute \'@list_sort\' argument is not array"'
+                return (
+                    '```json\n{"type":"tool_call","name":"terminal",'
+                    '"arguments":{"command":"pwd"}}\n```'
+                )
+
+        fake_llm = FakeLLM()
+        original_llm = compat._raw_llm
+        compat._raw_llm = fake_llm
+        try:
+            client = TestClient(compat.app)
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "kingogpt-web",
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": "What is the current working directory?",
+                        }
+                    ],
+                    "tools": [
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "terminal",
+                                "description": "Run a shell command.",
+                                "parameters": {
+                                    "type": "object",
+                                    "properties": {
+                                        "command": {"type": "string"},
+                                    },
+                                    "required": ["command"],
+                                },
+                            },
+                        }
+                    ],
+                },
+            )
+        finally:
+            compat._raw_llm = original_llm
+
+        self.assertEqual(response.status_code, 200)
+        choice = response.json()["choices"][0]
+        self.assertEqual(choice["finish_reason"], "tool_calls")
+        self.assertEqual(len(fake_llm.prompts), 3)
+        self.assertIn("Serialization task", fake_llm.prompts[2])
 
     def test_raw_chat_completion_finishes_tool_smoke_after_tool_result(self):
         try:

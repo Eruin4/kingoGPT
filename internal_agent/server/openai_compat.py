@@ -19,6 +19,7 @@ from internal_agent.llm.azure_web_adapter import AzureWebLLM
 from kingogpt.tool_adapter import (
     convert_kingogpt_json_to_openai_message,
     finish_reason_for_message,
+    parse_kingogpt_json_message,
     render_tool_contract,
     sanitize_openai_tool_calls,
 )
@@ -91,13 +92,13 @@ class ChatCompletionRequest(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     model: str = DEFAULT_MODEL_ID
-    messages: list[dict[str, Any]]
+    messages: list[Any]
     stream: bool = False
     temperature: float | None = None
     max_tokens: int | None = None
     top_p: float | None = None
     stop: str | list[str] | None = None
-    tools: list[dict[str, Any]] | None = None
+    tools: list[Any] | None = None
     tool_choice: Any | None = None
     presence_penalty: float | None = None
     frequency_penalty: float | None = None
@@ -112,7 +113,7 @@ class ResponsesRequest(BaseModel):
     input: str | list[Any]
     instructions: str | None = None
     stream: bool = False
-    tools: list[dict[str, Any]] | None = None
+    tools: list[Any] | None = None
     tool_choice: Any | None = None
     temperature: float | None = None
     max_output_tokens: int | None = None
@@ -188,32 +189,47 @@ def summarize_tools(tools: list[dict[str, Any]] | None) -> list[str]:
         return []
     names: list[str] = []
     for tool in tools:
+        if not isinstance(tool, dict):
+            names.append(str(tool))
+            continue
         tool_type = tool.get("type", "unknown")
         if tool_type == "function":
             function = tool.get("function") or {}
+            if not isinstance(function, dict):
+                function = {}
             names.append(f"function:{function.get('name', 'unknown')}")
         else:
             names.append(str(tool_type))
     return names
 
 
-def tool_function_names(tools: list[dict[str, Any]] | None) -> set[str]:
-    names: set[str] = set()
+def tool_function_map(tools: list[dict[str, Any]] | None) -> dict[str, dict[str, Any]]:
+    functions: dict[str, dict[str, Any]] = {}
     for tool in tools or []:
-        if tool.get("type") == "function":
-            function = tool.get("function") or {}
-            name = function.get("name")
-            if isinstance(name, str):
-                names.add(name)
-    return names
+        if not isinstance(tool, dict):
+            continue
+        if tool.get("type") != "function":
+            continue
+        function = tool.get("function") or {}
+        if not isinstance(function, dict):
+            continue
+        name = function.get("name")
+        if isinstance(name, str) and name:
+            functions[name] = function
+    return functions
 
 
 def has_tool_result(messages: list[dict[str, Any]]) -> bool:
-    return any(message.get("role") == "tool" for message in messages)
+    return any(
+        isinstance(message, dict) and message.get("role") == "tool"
+        for message in messages
+    )
 
 
 def latest_user_text(messages: list[dict[str, Any]]) -> str:
     for message in reversed(messages):
+        if not isinstance(message, dict):
+            continue
         if message.get("role") == "user":
             return _content_to_text(message.get("content"))
     return ""
@@ -266,17 +282,23 @@ def messages_to_prompt_and_system(messages: list[dict[str, Any]]) -> tuple[str, 
     max_chars = _env_int("KINGOGPT_MAX_PROMPT_CHARS", DEFAULT_MAX_PROMPT_CHARS)
 
     for message in messages:
-        role = message.get("role", "user")
-        content = _content_to_text(message.get("content"))
-        if not content.strip() and not message.get("tool_calls"):
+        if isinstance(message, dict):
+            role = message.get("role", "user")
+            content = _content_to_text(message.get("content"))
+            tool_calls = message.get("tool_calls")
+        else:
+            role = "user"
+            content = _content_to_text(message)
+            tool_calls = None
+        if not content.strip() and not tool_calls:
             continue
         if role == "system":
             system_blocks.append(content)
         else:
             label = "TOOL" if role == "tool" else role.upper()
-            if role == "assistant" and not content.strip() and message.get("tool_calls"):
+            if role == "assistant" and not content.strip() and tool_calls:
                 content = json.dumps(
-                    sanitize_openai_tool_calls(message["tool_calls"]),
+                    sanitize_openai_tool_calls(tool_calls),
                     ensure_ascii=False,
                 )
             blocks.append(f"{label}:\n{content}")
@@ -293,71 +315,176 @@ def messages_to_prompt(messages: list[dict[str, Any]]) -> str:
     return prompt
 
 
-def maybe_make_tool_call(req: ChatCompletionRequest) -> dict[str, Any] | None:
-    if not req.tools or has_tool_result(req.messages):
-        return None
+def append_tool_guidance_to_prompt(prompt: str, tools: list[dict[str, Any]]) -> str:
+    guidance = render_tool_contract(tools)
+    suffix = "\n\nASSISTANT:"
+    if prompt.endswith(suffix):
+        return f"{prompt[: -len(suffix)]}\n\nTOOL GUIDANCE:\n{guidance}{suffix}"
+    return f"{prompt}\n\nTOOL GUIDANCE:\n{guidance}"
 
-    if req.tool_choice == "none":
-        return None
 
-    available = tool_function_names(req.tools)
-    user_text = latest_user_text(req.messages).lower()
-    asks_for_tools = any(
-        phrase in user_text
-        for phrase in (
-            "use your available tools",
-            "use tools",
-            "using tools",
-            "도구",
-            "툴",
-            "tool",
+def validate_tool_call_message(
+    message: dict[str, Any],
+    tools: list[dict[str, Any]] | None,
+) -> tuple[dict[str, Any] | None, str | None]:
+    tool_calls = message.get("tool_calls")
+    if not tool_calls:
+        return message, None
+    functions = tool_function_map(tools)
+    sanitized = sanitize_openai_tool_calls(tool_calls)
+    for tool_call in sanitized:
+        function = tool_call["function"]
+        name = function["name"]
+        if name not in functions:
+            return None, f"Unknown tool name '{name}'."
+        try:
+            arguments = json.loads(function["arguments"])
+        except Exception:
+            return None, f"Arguments for tool '{name}' are not valid JSON."
+        if not isinstance(arguments, dict):
+            return None, f"Arguments for tool '{name}' must be a JSON object."
+        parameters = functions[name].get("parameters") or {}
+        if not isinstance(parameters, dict):
+            parameters = {}
+        for required in parameters.get("required") or []:
+            if isinstance(required, str) and required not in arguments:
+                return None, f"Arguments for tool '{name}' are missing required field '{required}'."
+        properties = parameters.get("properties") or {}
+        if parameters.get("additionalProperties") is False and isinstance(properties, dict):
+            extras = sorted(set(arguments) - set(properties))
+            if extras:
+                return None, (
+                    f"Arguments for tool '{name}' include unsupported fields: "
+                    f"{', '.join(extras)}."
+                )
+    return {"role": "assistant", "content": None, "tool_calls": sanitized}, None
+
+
+def repair_tool_message_prompt(raw: str, error: str, tools: list[dict[str, Any]]) -> str:
+    previous = (
+        "[omitted because it contained forbidden internal at-sign tool syntax]"
+        if "@" in raw
+        else raw
+    )
+    return (
+        "Your previous response could not be converted to OpenAI tool_calls.\n"
+        f"Validation error: {error}\n\n"
+        "This is a formatting correction. Do not answer the user directly.\n"
+        "The client provided the functions below. Do not say they are unavailable.\n"
+        "You are not executing a function; you are only writing JSON for the client.\n"
+        "Return exactly one valid JSON object using one of these shapes:\n"
+        '{"type":"tool_call","name":"<tool_name>","arguments":{...}}\n'
+        '{"type":"final","content":"<answer>"}\n\n'
+        "Do not use markdown, Python snippets, HTML comments, or internal at-sign tool syntax.\n"
+        "Use only this client tool catalog:\n"
+        f"{render_tool_contract(tools)}\n\n"
+        "Previous response:\n"
+        f"{previous}"
+    )
+
+
+def focused_tool_message_prompt(error: str, tools: list[dict[str, Any]]) -> str:
+    functions = tool_function_map(tools)
+    if len(functions) != 1:
+        return repair_tool_message_prompt("", error, tools)
+    name, function = next(iter(functions.items()))
+    parameters = function.get("parameters") if isinstance(function, dict) else {}
+    properties = parameters.get("properties") if isinstance(parameters, dict) else {}
+    required = parameters.get("required") if isinstance(parameters, dict) else []
+    required_text = ", ".join(item for item in required if isinstance(item, str)) or "none"
+    example_arguments = {}
+    if isinstance(properties, dict) and "command" in properties:
+        example_arguments["command"] = "pwd"
+    for item in required:
+        if isinstance(item, str) and item not in example_arguments:
+            example_arguments[item] = "value"
+    example = json.dumps(
+        {"type": "tool_call", "name": name, "arguments": example_arguments},
+        ensure_ascii=False,
+    )
+    field_lines = [
+        "type=tool_call",
+        f"name={name}",
+        *[f"arguments.{key}={value}" for key, value in example_arguments.items()],
+    ]
+    return (
+        "Serialization task. Convert this record to compact JSON.\n"
+        "Do not execute anything. Do not evaluate whether anything is available.\n"
+        "The JSON schema has fields: type, name, arguments.\n"
+        f"Required argument field names: {required_text}.\n"
+        "Record:\n"
+        + "\n".join(field_lines)
+        + f"\nReference shape: {example}"
+    )
+
+
+def looks_like_tool_substitute(raw: str) -> bool:
+    lowered = raw.lower()
+    tool_comment = re.search(r"<!--\s*tools?\s*:\s*([^>]+)-->", lowered)
+    if tool_comment:
+        requested = tool_comment.group(1).strip()
+        if requested and requested not in {"none", "false", "no"}:
+            return True
+    if "failed to execute '@" in lowered or "failed to execute @" in lowered:
+        return True
+    if "```" not in raw:
+        return False
+    return any(
+        marker in lowered
+        for marker in (
+            "```python",
+            "```bash",
+            "```sh",
+            "os.getcwd",
+            "subprocess",
+            "pwd",
+            "ls -",
+            "get-childitem",
         )
     )
-    asks_to_inspect_files = any(
-        phrase in user_text
-        for phrase in (
-            "current working directory",
-            "working directory",
-            "inspect",
-            "list files",
-            "filename",
-            "파일",
-            "디렉토리",
-            "폴더",
-        )
-    )
 
-    if not asks_for_tools and req.tool_choice in (None, "auto"):
-        return None
 
-    tool_name: str | None = None
-    arguments: dict[str, Any] = {}
-    if asks_to_inspect_files and "search_files" in available:
-        tool_name = "search_files"
-        arguments = {
-            "pattern": "*",
-            "target": "files",
-            "path": ".",
-            "limit": 25,
-        }
-    elif "terminal" in available:
-        tool_name = "terminal"
-        arguments = {
-            "command": "pwd && ls -la",
-            "timeout": 30,
-        }
-
-    if tool_name is None:
-        return None
-
-    return {
-        "id": "call_kingogpt_1",
-        "type": "function",
-        "function": {
-            "name": tool_name,
-            "arguments": json.dumps(arguments, ensure_ascii=False),
-        },
-    }
+def complete_validated_message(
+    prompt: str,
+    system_prompt: str,
+    tools: list[dict[str, Any]] | None,
+) -> tuple[str, dict[str, Any]]:
+    answer = _raw_llm.complete(prompt, system_prompt=system_prompt)
+    message = convert_kingogpt_json_to_openai_message(answer)
+    if not tools:
+        return answer, message
+    parsed = parse_kingogpt_json_message(answer)
+    if not message.get("tool_calls"):
+        if not isinstance(parsed, dict) or not (parsed.get("type") == "tool_call" or parsed.get("call")):
+            if not looks_like_tool_substitute(answer):
+                return answer, message
+            error = "Response used markdown, code, or hidden comments instead of a tool_call."
+        else:
+            error = "Response looked like a tool call but was not valid."
+    else:
+        error = None
+    validated, validation_error = validate_tool_call_message(message, tools)
+    error = error or validation_error
+    if validated is not None and error is None:
+        return answer, validated
+    if parsed is None and error is None:
+        error = "Response was not a valid JSON object."
+    logger.warning("chat_tool_call_repair reason=%s raw=%r", error, answer[:500])
+    repair_error = error or "Invalid tool call."
+    repair_prompts = [
+        repair_tool_message_prompt(answer, repair_error, tools),
+        focused_tool_message_prompt(repair_error, tools),
+    ]
+    last_repaired_answer = ""
+    for repair_prompt in repair_prompts:
+        repaired_answer = _raw_llm.complete(repair_prompt, system_prompt=None)
+        last_repaired_answer = repaired_answer
+        repaired_message = convert_kingogpt_json_to_openai_message(repaired_answer)
+        validated, _ = validate_tool_call_message(repaired_message, tools)
+        if validated is not None and validated.get("tool_calls"):
+            return repaired_answer, validated
+    logger.warning("chat_tool_call_repair_failed raw=%r", last_repaired_answer[:500])
+    return answer, message
 
 
 def first_filename_from_tool_output(messages: list[dict[str, Any]]) -> str | None:
@@ -431,31 +558,6 @@ def make_completion_response(model: str, content: str) -> dict[str, Any]:
             }
         ],
         "usage": usage_object("", "", content),
-    }
-
-
-def make_tool_call_response(model: str, tool_call: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "id": "chatcmpl-kingogpt",
-        "object": "chat.completion",
-        "created": int(time.time()),
-        "model": model,
-        "choices": [
-            {
-                "index": 0,
-                "message": {
-                    "role": "assistant",
-                    "content": None,
-                    "tool_calls": [tool_call],
-                },
-                "finish_reason": "tool_calls",
-            }
-        ],
-        "usage": {
-            "prompt_tokens": 0,
-            "completion_tokens": 0,
-            "total_tokens": 0,
-        },
     }
 
 
@@ -645,28 +747,20 @@ def raw_chat_completions(req: ChatCompletionRequest):
     log_openai_request("/v1/chat/completions", req)
     prompt, system_prompt = messages_to_prompt_and_system(req.messages)
     if req.tools:
+        prompt = append_tool_guidance_to_prompt(prompt, req.tools)
         system_prompt = "\n\n".join(
             part for part in (system_prompt, render_tool_contract(req.tools)) if part
         )
     logger.warning(
         "chat_roles roles=%s tools=%s has_tool_result=%s latest_user=%r",
-        [message.get("role", "user") for message in req.messages],
+        [
+            message.get("role", "user") if isinstance(message, dict) else type(message).__name__
+            for message in req.messages
+        ],
         summarize_tools(req.tools),
         has_tool_result(req.messages),
         latest_user_text(req.messages)[:160],
     )
-    tool_call = maybe_make_tool_call(req)
-    if tool_call is not None:
-        logger.warning("chat_tool_call name=%s args=%s", tool_call["function"]["name"], tool_call["function"]["arguments"])
-        if req.stream:
-            def generate_tool_call():
-                yield sse_event(make_chat_role_chunk(req.model))
-                yield sse_event(make_chat_tool_call_chunk(req.model, tool_call))
-                yield sse_event(make_chat_done_chunk(req.model, "tool_calls"))
-                yield "data: [DONE]\n\n"
-
-            return StreamingResponse(generate_tool_call(), media_type="text/event-stream")
-        return make_tool_call_response(req.model, tool_call)
     tool_result_final = maybe_make_tool_result_final(req)
     if tool_result_final is not None:
         logger.warning("chat_tool_result_final content=%r", tool_result_final)
@@ -688,8 +782,7 @@ def raw_chat_completions(req: ChatCompletionRequest):
     if req.stream:
         def generate():
             try:
-                answer = _raw_llm.complete(prompt, system_prompt=system_prompt)
-                message = convert_kingogpt_json_to_openai_message(answer)
+                answer, message = complete_validated_message(prompt, system_prompt, req.tools)
                 usage = usage_object(prompt, system_prompt, answer)
                 yield from stream_openai_message(
                     req.model,
@@ -710,7 +803,7 @@ def raw_chat_completions(req: ChatCompletionRequest):
         return StreamingResponse(generate(), media_type="text/event-stream")
 
     try:
-        answer = _raw_llm.complete(prompt, system_prompt=system_prompt)
+        answer, message = complete_validated_message(prompt, system_prompt, req.tools)
     except Exception as exc:
         raise HTTPException(
             status_code=502,
@@ -722,7 +815,6 @@ def raw_chat_completions(req: ChatCompletionRequest):
             },
         ) from exc
 
-    message = convert_kingogpt_json_to_openai_message(answer)
     return make_message_response_with_usage(
         req.model,
         message,

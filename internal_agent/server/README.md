@@ -60,6 +60,8 @@ or:
 
 The server maps `tool_call` responses to OpenAI-style `message.tool_calls`
 with `assistant.content = null` and `finish_reason = "tool_calls"`.
+It validates those tool names and arguments against the client-supplied
+`tools`, but it does not synthesize or execute tool calls itself.
 The older `{"call":"exec","args":{...}}` and `{"reply":"..."}` shapes are still
 accepted for compatibility.
 When a client sends an assistant message with prior `tool_calls`, the server

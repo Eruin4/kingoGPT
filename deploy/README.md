@@ -40,8 +40,18 @@ OpenAI-compatible call:
 ```bash
 curl http://127.0.0.1:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{"model":"internal-azure-web-agent","messages":[{"role":"user","content":"hello"}]}'
+  -d '{"model":"kingogpt-web","messages":[{"role":"user","content":"hello"}]}'
 ```
+
+## Hermes Provider Notes
+
+Point Hermes at this server as an OpenAI-compatible provider:
+
+- base URL: `http://127.0.0.1:8000/v1`
+- model: `kingogpt-web`
+- API key: any non-empty placeholder, if Hermes requires one
+
+`/v1/chat/completions` is the preferred path. `/v1/responses` is available for clients that choose the Responses API, but hosted OpenAI tools are accepted only for compatibility and are not executed by this server yet.
 
 ## Runtime State
 

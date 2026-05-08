@@ -41,7 +41,9 @@ The `standalone/` package is not on the normal production path. It is experiment
 
 - `/v1/chat/completions` is the primary Hermes path.
 - `/v1/responses` is a minimal compatibility layer, not a complete hosted-tools implementation yet.
-- `tools` and `tool_choice` are accepted and logged when debug is enabled, but hosted tools are not executed by this server yet.
+- `tools` and `tool_choice` are accepted and logged when debug is enabled. Chat Completions can convert KingoGPT-emitted JSON tool calls into OpenAI `message.tool_calls`, but hosted tools are not executed by this server and tool calls are not synthesized server-side.
+- Usage fields are approximate. They are included for client compatibility, not billing or exact token accounting.
+- Streaming emits OpenAI-shaped SSE events, but the upstream KingoGPT answer currently arrives as one completed text delta.
 - The standalone JSON-action agent is not a substitute for OpenAI tool calling until it is explicitly wired into the OpenAI-compatible endpoints.
 - `AzureWebLLM` is serialized with a lock because it updates token/session cache state.
 - Long conversations are trimmed before being sent upstream.
