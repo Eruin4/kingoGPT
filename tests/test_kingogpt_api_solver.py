@@ -2,8 +2,8 @@ import argparse
 import unittest
 from unittest import mock
 
-import kingogpt_api_solver as solver
-import kingogpt_token_capture
+import kingogpt.api_solver as solver
+import kingogpt.token_capture
 
 
 class KingoGPTApiSolverPromptTests(unittest.TestCase):
@@ -71,17 +71,17 @@ class KingoGPTTokenRefreshTests(unittest.TestCase):
             password=None,
         )
         with mock.patch.object(
-            kingogpt_token_capture,
+            kingogpt.token_capture,
             "candidate_config_files",
             return_value=["kingogpt_config.json"],
         ):
             with mock.patch.object(
-                kingogpt_token_capture,
+                kingogpt.token_capture,
                 "load_json_file",
                 return_value={"id": "user1", "password": "pw1"},
             ):
                 self.assertEqual(
-                    kingogpt_token_capture.resolve_credentials(args),
+                    kingogpt.token_capture.resolve_credentials(args),
                     ("user1", "pw1"),
                 )
 
@@ -100,7 +100,7 @@ class KingoGPTTokenRefreshTests(unittest.TestCase):
             captured["args"] = capture_args
             return expected
 
-        with mock.patch.object(kingogpt_token_capture, "refresh_token_cache", fake_refresh):
+        with mock.patch.object(kingogpt.token_capture, "refresh_token_cache", fake_refresh):
             result = solver.refresh_token_cache(args)
 
         self.assertEqual(result, expected)

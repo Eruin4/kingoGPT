@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kingogpt"
+version = "0.1.0"
+description = "KingoGPT API solver and token capture utilities"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "requests>=2.31",
+    "playwright>=1.40",
+]
+
+[project.scripts]
+kingogpt-api-solver = "kingogpt.api_solver:main"
+kingogpt-token-capture = "kingogpt.token_capture:main"
+
+[tool.setuptools.packages.find]
+include = ["kingogpt*"]
