@@ -5,6 +5,8 @@ __pycache__/
 state/
 secrete/
 secrets/
+server_backups/
+hermingo/
 tmp_api_check/
 
 .env
