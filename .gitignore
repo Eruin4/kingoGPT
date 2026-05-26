@@ -9,6 +9,11 @@ server_backups/
 hermingo/
 tmp_api_check/
 
+# Credential and token files (catch them wherever they appear)
+kingogpt_token_cache.json
+kingogpt_config.json
+kingogpt_chrome_profile/
+
 .env
 .env.*
 !.env.example

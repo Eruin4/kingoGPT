@@ -1,27 +1,36 @@
 import json
+import re
 import uuid
 from typing import Any
 
 
-STRICT_TOOL_CONTRACT = """You may use client-side tools, but only when the task needs outside state.
+STRICT_TOOL_CONTRACT = """CRITICAL INSTRUCTION: follow this tool protocol exactly.
 
-If the user asks something you can answer from the conversation, answer normally.
+You are connected to a client that executes tools on your behalf.
+You do NOT have a Python sandbox, file system, or shell.
+You CANNOT run code yourself. The ONLY way to interact with the outside world
+is by returning a JSON tool_call object.
 
-If the user asks for current environment, files, shell output, or other information
-you cannot know from the conversation, choose exactly one available tool by returning
-only this JSON object:
+When the user asks for information that requires accessing files, running commands,
+listing directories, checking the environment, or any action you cannot answer
+from conversation alone, you MUST respond with ONLY this JSON object and nothing else:
 
-{"type":"tool_call","name":"<tool_name>","arguments":{...}}
+{"type":"tool_call","name":"TOOL_NAME_HERE","arguments":{...}}
 
-The client tool catalog below is the complete set of tools you may use. If you
-would otherwise inspect the environment with Python, shell, markdown code, or a
-hidden tool comment, return a tool_call for one of the listed tools instead.
-Never use internal at-sign tool syntax.
+When you can answer from conversation context alone, respond with ONLY:
+{"type":"final","content":"your answer here"}
 
-After a tool result is provided, answer the user based on that result.
+Rules:
+- Your entire response must be a single JSON object. No markdown. No explanation.
+- NEVER use code fences or code blocks of any language.
+- NEVER use HTML comment syntax.
+- NEVER use internal tool syntax of any kind.
+- NEVER write Python code like os.listdir() or subprocess.run().
+- NEVER reference /mnt/data. You have no sandbox.
+- NEVER fabricate tool results. Wait for the client to return the result.
+- After a tool result is provided, answer based on that result using the final JSON format.
 
-Do not claim to run tools yourself. Do not invent tool results. Do not include
-markdown code blocks or HTML comments as substitutes for tool calls."""
+The tool catalog is listed below. Use ONLY these tools."""
 
 
 def render_messages(messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None) -> str:
@@ -77,6 +86,8 @@ def render_available_tools(tools: list[dict[str, Any]]) -> str:
         parameters = function.get("parameters") or {}
         properties = parameters.get("properties") if isinstance(parameters, dict) else {}
         required = parameters.get("required") if isinstance(parameters, dict) else []
+        if not isinstance(required, list):
+            required = []
         argument_parts: list[str] = []
         if isinstance(properties, dict):
             for argument_name, schema in properties.items():
@@ -92,11 +103,12 @@ def render_available_tools(tools: list[dict[str, Any]]) -> str:
         )
         if isinstance(description, str) and description:
             lines.append(
-                f"Tool {name}: {description} Arguments: {argument_text}. "
-                f"Example: {example}"
+                f"- {name}: {description} | args: {argument_text} | "
+                f"example: {example}"
             )
         else:
-            lines.append(f"Tool {name}: Arguments: {argument_text}. Example: {example}")
+            lines.append(f"- {name}: args: {argument_text} | example: {example}")
+    lines.append("\nRespond with ONLY a JSON object. No other text.")
     return "\n".join(lines)
 
 
@@ -159,8 +171,20 @@ def convert_kingogpt_json_to_openai_message(raw: str) -> dict[str, Any]:
     if obj.get("type") == "tool_call":
         return _tool_call_message(obj.get("name"), obj.get("arguments", {}))
 
+    # Alternative shapes the model sometimes produces
+    if obj.get("type") == "function" and obj.get("name"):
+        return _tool_call_message(obj["name"], obj.get("arguments", {}))
+
     if obj.get("call"):
         return _tool_call_message(obj.get("call"), obj.get("args", {}))
+
+    if obj.get("function") and isinstance(obj["function"], dict):
+        func = obj["function"]
+        if func.get("name"):
+            return _tool_call_message(func["name"], func.get("arguments", {}))
+
+    if obj.get("tool") and isinstance(obj.get("tool"), str):
+        return _tool_call_message(obj["tool"], obj.get("arguments", obj.get("args", {})))
 
     if "reply" in obj:
         return {"role": "assistant", "content": obj["reply"]}
@@ -265,6 +289,106 @@ def _extract_json_object(text: str) -> dict[str, Any] | None:
     except Exception:
         return None
     return obj if isinstance(obj, dict) else None
+
+
+def infer_tool_call_from_failed_response(
+    raw: str,
+    tools: list[dict[str, Any]],
+    user_text: str,
+) -> dict[str, Any] | None:
+    """Best-effort heuristic: extract intent from a failed response and build a tool_call.
+
+    When the KingoGPT model ignores the JSON tool_call contract and instead writes
+    Python code, bash commands, or ``<!-- tools: ... -->`` comments, this function
+    tries to figure out what tool it *meant* to call and returns a synthetic
+    OpenAI-format tool_call message.  Returns ``None`` if no confident match.
+    """
+    functions = {}
+    for tool in tools or []:
+        if not isinstance(tool, dict) or tool.get("type") != "function":
+            continue
+        func = tool.get("function") or {}
+        name = func.get("name")
+        if isinstance(name, str) and name:
+            functions[name] = func
+
+    if not functions:
+        return None
+
+    user_lowered = user_text.lower()
+
+    # --- Heuristic 1: extract a shell command from code blocks in the response ---
+    shell_command = None
+    bash_match = re.search(r'```(?:bash|sh|shell)\s*\n(.+?)\n```', raw, re.DOTALL)
+    if bash_match:
+        shell_command = bash_match.group(1).strip().splitlines()[0].strip()
+
+    # Try Python subprocess patterns
+    if not shell_command:
+        sub_match = re.search(
+            r'subprocess\.(?:run|call|check_output)\(\[?["\']([\w\s./-]+'  # noqa: E501
+            r'["\'])',
+            raw,
+        )
+        if sub_match:
+            shell_command = sub_match.group(1)
+
+    # Try os.listdir / os.getcwd / ls patterns inside Python code
+    if not shell_command:
+        if 'os.listdir' in raw or 'os.getcwd' in raw:
+            shell_command = 'ls -la'
+        elif re.search(r'os\.(?:system|popen)\(["\'](.*?)["\']\)', raw):
+            match = re.search(r'os\.(?:system|popen)\(["\'](.*?)["\']\)', raw)
+            if match:
+                shell_command = match.group(1)
+
+    if shell_command and "terminal" in functions:
+        return _tool_call_message("terminal", {"command": shell_command})
+
+    # --- Heuristic 2: user asked for files/directory listing ---
+    # Only match against user_text, not the raw error response.
+    # Use regex to match word combinations with intervening words.
+    dir_match = (
+        re.search(r'\blist\b.*\b(?:file|dir|folder)', user_lowered)
+        or re.search(r'\bfiles?\b.*\b(?:in|of|on|from)\b.*\b(?:dir|folder|home)', user_lowered)
+        or re.search(r'\b(?:what|show|which)\b.*\bfiles?\b', user_lowered)
+        or re.search(r'\b(?:current|working|home)\s+directory\b', user_lowered)
+        or re.search(r'\bls\b', user_lowered)
+        or re.search(r'파일.{0,4}(?:목록|리스트|뭐|어떤|있)', user_lowered)
+        or re.search(r'디렉토리.{0,4}(?:목록|내용|확인)', user_lowered)
+        or re.search(r'폴더.{0,4}(?:목록|내용)', user_lowered)
+    )
+    if dir_match:
+        if "search_files" in functions:
+            return _tool_call_message("search_files", {
+                "pattern": "*", "target": "files", "path": ".", "limit": 50,
+            })
+        if "terminal" in functions:
+            return _tool_call_message("terminal", {"command": "ls -la"})
+
+    # --- Heuristic 3: user asked to read a file ---
+    read_keywords = {'read', 'show', 'cat', 'view', 'open', 'content', '읽', '보여', '내용'}
+    if any(kw in user_lowered for kw in read_keywords) and "read_file" in functions:
+        # Try to extract a filename from the user prompt
+        file_match = re.search(
+            r'["\']?([\w./-]+\.(?:py|md|txt|json|yaml|yml|toml|sh|js|ts|css|html))["\']?',
+            user_text,
+        )
+        if file_match:
+            return _tool_call_message("read_file", {"path": file_match.group(1)})
+
+    # --- Heuristic 4: fallback for Python code that looks like file operations ---
+    if '```python' in raw.lower() and "terminal" in functions:
+        # The model wanted to run Python; map it to a terminal command
+        python_match = re.search(r'```python\s*\n(.+?)\n```', raw, re.DOTALL)
+        if python_match:
+            code = python_match.group(1).strip()
+            # If it's a short snippet, wrap in python -c
+            if len(code) < 200 and '\n' not in code:
+                return _tool_call_message("terminal", {"command": f'python3 -c "{code}"'})
+            return _tool_call_message("terminal", {"command": "ls -la"})
+
+    return None
 
 
 def _content_to_text(content: Any) -> str:

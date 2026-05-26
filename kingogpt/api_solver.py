@@ -1,30 +1,41 @@
 import argparse
 import asyncio
-import base64
 import hashlib
 import json
+import logging
 import os
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
 
+from kingogpt.exceptions import (
+    AuthenticationError,
+    KingoGPTError,
+    TokenCacheCorruptError,
+    TokenExpiredError,
+    TokenMissingError,
+)
+from kingogpt.shared import (
+    configure_output,
+    decode_jwt_payload,
+    fetch_user_profile,
+    load_token_cache,
+    write_token_cache,
+)
+
 QUERY_URL = "https://kingogpt.skku.edu/v2/athena/chats/m1/queries"
-IDENTIX_ME_URL = "https://kingogpt.skku.edu/v2/identix/users/me"
 CHAT_THREAD_URL = "https://kingogpt.skku.edu/v2/datahub/chats/threads/{thread_id}"
 DEFAULT_SCENARIO_ID = "robi-gpt-dev:workflow_c0hfnXS236g4FKO"
 DEFAULT_CHAT_ROOM_ID = 14
 DEFAULT_TOKEN_CACHE = Path(__file__).with_name("kingogpt_token_cache.json")
 TOKEN_EXPIRY_SKEW_SECONDS = 300
 
+logger = logging.getLogger("kingogpt.api_solver")
 
-def configure_output() -> None:
-    for stream_name in ("stdout", "stderr"):
-        stream = getattr(sys, stream_name, None)
-        if stream is not None and hasattr(stream, "reconfigure"):
-            stream.reconfigure(encoding="utf-8", errors="replace")
+
 
 
 def parse_args() -> argparse.Namespace:
@@ -104,38 +115,14 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def decode_jwt_payload(token: str) -> dict:
-    try:
-        payload_segment = token.split(".")[1]
-        padding = "=" * (-len(payload_segment) % 4)
-        decoded = base64.urlsafe_b64decode(payload_segment + padding)
-        return json.loads(decoded)
-    except Exception as exc:
-        raise RuntimeError("Failed to decode access token JWT.") from exc
-
-
-def load_token_cache(path_str: str) -> dict:
-    path = Path(path_str)
-    if not path.exists():
-        return {}
-
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(f"Failed to parse token cache file: {path}") from exc
-
-
-def write_token_cache(path_str: str, cache: dict) -> None:
-    path = Path(path_str)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(cache, ensure_ascii=True, indent=2), encoding="utf-8")
+# decode_jwt_payload, load_token_cache, write_token_cache — imported from shared.py
 
 
 def resolve_access_token(args: argparse.Namespace, cache: dict) -> str:
     token = (args.access_token or cache.get("access_token") or "").strip()
     if not token:
         cache_path = Path(args.token_cache)
-        raise RuntimeError(
+        raise TokenMissingError(
             "access token is missing. "
             f"Create `{cache_path.name}` first or pass --access-token."
         )
@@ -151,7 +138,7 @@ def ensure_token_is_fresh(token: str, *, ignore_expiry: bool) -> dict:
     now = int(time.time())
     if exp <= now + TOKEN_EXPIRY_SKEW_SECONDS:
         expires_at = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(exp))
-        raise RuntimeError(
+        raise TokenExpiredError(
             "access token is expired or about to expire "
             f"(exp={expires_at}). Refresh it with kingogpt.token_capture.py."
         )
@@ -160,6 +147,10 @@ def ensure_token_is_fresh(token: str, *, ignore_expiry: bool) -> dict:
 
 
 def should_auto_refresh_token(error: Exception) -> bool:
+    # Fast path: typed exceptions from this package.
+    if isinstance(error, (TokenMissingError, TokenExpiredError, TokenCacheCorruptError, AuthenticationError)):
+        return True
+    # Backward-compatible substring matching for RuntimeError messages.
     message = str(error).lower()
     return any(
         needle in message
@@ -180,7 +171,7 @@ def refresh_token_cache(args: argparse.Namespace) -> dict:
     if args.no_auto_refresh_token:
         raise RuntimeError("Automatic token refresh is disabled.")
 
-    print("[*] Refreshing KingoGPT login token...")
+    logger.info("Refreshing KingoGPT login token...")
     try:
         import kingogpt.token_capture
     except ImportError as exc:
@@ -221,38 +212,7 @@ def load_or_refresh_token(args: argparse.Namespace) -> tuple[dict, str, dict, di
         return cache, token, claims, user
 
 
-def fetch_user_profile(token: str) -> dict:
-    response = requests.get(
-        IDENTIX_ME_URL,
-        headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
-        timeout=20,
-    )
-    try:
-        response.raise_for_status()
-    except requests.HTTPError as exc:
-        snippet = response.text[:500]
-        raise RuntimeError(
-            f"User profile lookup failed: HTTP {response.status_code} {snippet}"
-        ) from exc
-
-    payload = response.json()
-    documents = ((payload.get("data") or {}).get("documents")) or []
-    if not documents:
-        raise RuntimeError("User profile response did not include any documents.")
-
-    document = documents[0]
-    groups = document.get("groups") or []
-    primary_group_name = groups[0]["name"] if groups else None
-
-    return {
-        "id": document.get("authUsersId"),
-        "loginId": document.get("username"),
-        "name": document.get("name"),
-        "email": document.get("email"),
-        "groupName": primary_group_name,
-        "userId": document.get("authUsersId"),
-        "status": document.get("status"),
-    }
+# fetch_user_profile — imported from shared.py
 
 
 def resolve_dynamic_system_prompt(args: argparse.Namespace) -> str:
@@ -288,7 +248,7 @@ def write_session_prompt_state(
         "promptHash": prompt_hash,
         "chatRoomId": chat_room_id,
         "chatThreadId": chat_thread_id,
-        "lastUsedAt": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "lastUsedAt": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
     if chat_room_id is not None:
         cache["last_chat_room_id"] = int(chat_room_id)

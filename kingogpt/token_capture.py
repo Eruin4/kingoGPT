@@ -1,7 +1,7 @@
 import argparse
 import asyncio
-import base64
 import json
+import logging
 import os
 import sys
 import time
@@ -9,6 +9,13 @@ from pathlib import Path
 
 import requests
 from playwright.async_api import async_playwright
+
+from kingogpt.shared import (
+    configure_output,
+    decode_jwt_payload,
+    fetch_user_profile,
+    write_token_cache,
+)
 
 START_URL = "https://www.skku.edu/skku/kingoGPT.do"
 IDENTIX_ME_URL = "https://kingogpt.skku.edu/v2/identix/users/me"
@@ -18,12 +25,10 @@ DEFAULT_PROFILE_DIR = Path(__file__).with_name("kingogpt_chrome_profile")
 DEFAULT_TIMEOUT_SECONDS = 300
 AUTO_LOGIN_WAIT_SECONDS = 60
 
+logger = logging.getLogger("kingogpt.token_capture")
 
-def configure_output() -> None:
-    for stream_name in ("stdout", "stderr"):
-        stream = getattr(sys, stream_name, None)
-        if stream is not None and hasattr(stream, "reconfigure"):
-            stream.reconfigure(encoding="utf-8", errors="replace")
+
+
 
 
 def parse_args() -> argparse.Namespace:
@@ -42,14 +47,8 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def decode_jwt_payload(token: str) -> dict:
-    try:
-        payload_segment = token.split(".")[1]
-        padding = "=" * (-len(payload_segment) % 4)
-        decoded = base64.urlsafe_b64decode(payload_segment + padding)
-        return json.loads(decoded)
-    except Exception as exc:
-        raise RuntimeError("Failed to decode access token JWT.") from exc
+# decode_jwt_payload — imported from shared.py
+
 
 
 def load_json_file(path: Path) -> dict:
@@ -91,29 +90,8 @@ def resolve_credentials(args: argparse.Namespace) -> tuple[str, str]:
     return login_id, password
 
 
-def fetch_user_profile(token: str) -> dict:
-    response = requests.get(
-        IDENTIX_ME_URL,
-        headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
-        timeout=20,
-    )
-    response.raise_for_status()
-    payload = response.json()
-    documents = ((payload.get("data") or {}).get("documents")) or []
-    if not documents:
-        raise RuntimeError("User profile response did not include any documents.")
+# fetch_user_profile — imported from shared.py
 
-    document = documents[0]
-    groups = document.get("groups") or []
-    return {
-        "id": document.get("authUsersId"),
-        "loginId": document.get("username"),
-        "name": document.get("name"),
-        "email": document.get("email"),
-        "groupName": groups[0].get("name") if groups else None,
-        "userId": document.get("authUsersId"),
-        "status": document.get("status"),
-    }
 
 
 async def read_tokens_from_frame_or_page(target) -> dict | None:
@@ -214,10 +192,8 @@ async def attempt_auto_login(page, login_id: str, password: str) -> bool:
     return False
 
 
-def write_cache(path_str: str, cache_data: dict) -> None:
-    path = Path(path_str)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(cache_data, ensure_ascii=True, indent=2), encoding="utf-8")
+# write_cache replaced by write_token_cache from shared.py
+
 
 
 async def refresh_token_cache(args: argparse.Namespace) -> dict:
@@ -243,10 +219,10 @@ async def refresh_token_cache(args: argparse.Namespace) -> dict:
         context = await playwright.chromium.launch_persistent_context(**launch_options)
         try:
             page = context.pages[0] if context.pages else await context.new_page()
-            print("[*] Opening KingoGPT...")
+            logger.info("Opening KingoGPT...")
             await page.goto(START_URL, wait_until="domcontentloaded", timeout=60_000)
 
-            print("[*] Attempting automatic login...")
+            logger.info("Attempting automatic login...")
             if not await attempt_auto_login(page, login_id, password):
                 raise RuntimeError("Automatic KingoGPT login failed or timed out.")
 
@@ -270,7 +246,7 @@ async def refresh_token_cache(args: argparse.Namespace) -> dict:
                 "claims": claims,
                 "user": profile,
             }
-            write_cache(args.cache_file, cache_data)
+            write_token_cache(args.cache_file, cache_data)
             return cache_data
         finally:
             await context.close()
@@ -278,11 +254,11 @@ async def refresh_token_cache(args: argparse.Namespace) -> dict:
 
 async def async_main(args: argparse.Namespace) -> int:
     cache_data = await refresh_token_cache(args)
-    print(f"[*] Token cache written: {args.cache_file}")
+    logger.info("Token cache written: %s", args.cache_file)
     if cache_data.get("expires_at"):
-        print(
-            "[*] Access token expires at: "
-            + time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(cache_data["expires_at"]))
+        logger.info(
+            "Access token expires at: %s",
+            time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(cache_data["expires_at"]))
         )
     return 0
 
