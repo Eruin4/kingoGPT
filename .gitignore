@@ -19,3 +19,11 @@ kingogpt_chrome_profile/
 !.env.example
 
 *.log
+
+# Local helpers (never upload to Git)
+git_helper.py
+check_remote.py
+deploy_to_server.py
+deploy_hermingo_git.py
+run_git.bat
+
