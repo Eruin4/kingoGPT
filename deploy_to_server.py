@@ -1,6 +1,7 @@
 import os
 import subprocess
 import sys
+import time
 
 # 로컬 및 원격 경로 정의
 local_base = r"C:\Users\ppggh\.antigravity-ide\kingoGPT"
@@ -21,7 +22,7 @@ files_to_deploy = [
 ]
 
 def run_local_cmd(cmd, cwd=r"C:\Windows", env=None):
-    """로컬에서 명령어 실행 (getcwd() 에러 방지를 위해 C:\Windows를 cwd로 지정)"""
+    """로컬에서 명령어 실행 (getcwd() 에러 방지를 위해 C:\\Windows를 cwd로 지정)"""
     r = subprocess.run(cmd, env=env, cwd=cwd, capture_output=True, text=True, encoding='utf-8', errors='ignore')
     return r
 
@@ -37,28 +38,33 @@ git_env["GIT_WORK_TREE"] = local_base
 
 # git add
 print("Adding files to git...")
-r = run_local_cmd([r"C:\Program Files\Git\cmd\git.exe", "add", "."], env=git_env)
-if r.returncode != 0:
-    print(f"Git add failed: {r.stderr}")
-else:
-    print("Git add completed.")
+run_local_cmd([r"C:\Program Files\Git\cmd\git.exe", "add", "."], env=git_env)
 
-# git commit
+# git commit (이미 커밋되어 있으면 그냥 넘어감)
 print("Committing files...")
 r = run_local_cmd([r"C:\Program Files\Git\cmd\git.exe", "commit", "-m", "Improve KingoGPT client parity, structure logging, and typed exceptions"], env=git_env)
-print(r.stdout or r.stderr)
+
+# git pull --rebase (충돌 해소)
+print("Pulling remote changes (rebase)...")
+r = run_local_cmd([r"C:\Program Files\Git\cmd\git.exe", "pull", "--rebase", "origin", "main"], env=git_env)
+print("Pull stdout:")
+print(r.stdout)
+print("Pull stderr:")
+print(r.stderr)
 
 # git push
 print("Pushing to GitHub...")
 r = run_local_cmd([r"C:\Program Files\Git\cmd\git.exe", "push", "origin", "main"], env=git_env)
-print(r.stdout or r.stderr)
+print("Push stdout:")
+print(r.stdout)
+print("Push stderr:")
+print(r.stderr)
 
 
 print("\n=== [2/4] SCP DEPLOYING FILES TO REMOTE SERVER ===")
 for local_rel, remote_abs in files_to_deploy:
     local_abs = os.path.join(local_base, local_rel)
     print(f"Deploying: {local_rel} -> {remote_abs}")
-    # SCP 전송
     scp_cmd = ['scp', '-o', 'BatchMode=yes', local_abs, f"{remote_user_host}:{remote_abs}"]
     r = run_local_cmd(scp_cmd)
     if r.returncode != 0:
@@ -69,7 +75,6 @@ for local_rel, remote_abs in files_to_deploy:
 
 print("\n=== [3/4] RESTARTING DOCKER CONTAINER ON REMOTE ===")
 print("Restarting hermingo docker container...")
-# docker compose restart hermingo 혹은 docker-compose restart
 r = run_remote_cmd(f"cd {remote_hermingo_base} && docker compose restart hermingo")
 print("STDOUT:")
 print(r.stdout)
@@ -78,6 +83,9 @@ print(r.stderr)
 
 
 print("\n=== [4/4] HEALTH CHECK ON REMOTE SERVER ===")
+print("Waiting 5 seconds for uvicorn to spin up...")
+time.sleep(5) # 컨테이너 내부 uvicorn 시작 대기
+
 # 컨테이너 포트 헬스체크
 r = run_remote_cmd("curl -s http://127.0.0.1:8000/health || curl -s http://127.0.0.1:8000/")
 print("Health check response:")
