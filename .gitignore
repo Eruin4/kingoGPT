@@ -34,3 +34,12 @@ docs/desktop-preserved-*/
 docs/*handoff*.md
 docs/*acceptance*
 docs/*daily-plan*
+
+# Server-only operational notes and reports
+/docs/hermes-*
+/docs/icampus-*
+/docs/interruption-check-*
+/docs/path-layout-*
+/docs/runtime-improvements-*
+/docs/site-analysis.md
+/docs/desktop-preserved-*/
