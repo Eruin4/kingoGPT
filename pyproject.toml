@@ -4,18 +4,27 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "kingogpt"
-version = "0.1.0"
-description = "KingoGPT API solver and token capture utilities"
+version = "0.2.0"
+description = "KingoGPT gateway and resumable workspace agent"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+    "fastapi>=0.115",
     "requests>=2.31",
     "playwright>=1.40",
+    "uvicorn>=0.30",
+    "jsonschema>=4.20",
 ]
+
+[project.optional-dependencies]
+agent = ["openai>=2", "openai-agents>=0.4"]
+test = ["httpx>=0.27", "openai>=2", "openai-agents>=0.4"]
 
 [project.scripts]
 kingogpt-api-solver = "kingogpt.api_solver:main"
 kingogpt-token-capture = "kingogpt.token_capture:main"
+kingogpt-openai-server = "kingogpt.openai_server:main"
+kingogpt-agent = "kingogpt.agent:main"
 
 [tool.setuptools.packages.find]
 include = ["kingogpt*"]

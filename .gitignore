@@ -1,31 +1,36 @@
+# Python
 .venv/
+venv/
 __pycache__/
 *.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.coverage
+htmlcov/
 
-state/
-secrete/
-secrets/
-server_backups/
-hermingo/
-tmp_api_check/
-
-# Credential and token files (catch them wherever they appear)
-kingogpt_token_cache.json
-kingogpt_config.json
-kingogpt_chrome_profile/
-
+# Local credentials and runtime state
 .env
 .env.*
 !.env.example
-
+state/
+**/state/
 *.log
+*.db
+*.db-*
 
-# Local helpers (never upload to Git)
-git_helper.py
-check_remote.py
-deploy_to_server.py
-deploy_hermingo_git.py
-run_git.bat
-forai.md
+# Browser profiles and agent run data
+**/*chrome_profile*/
+**/agent_runs/
+trajectory*.jsonl
 
+# Local Hermes checkout is maintained separately
+/hermes/
+/deploy/hermes/
 
+# Local-only operations and acceptance reports
+docs/desktop-preserved-*/
+docs/*handoff*.md
+docs/*acceptance*
+docs/*daily-plan*

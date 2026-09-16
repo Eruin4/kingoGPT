@@ -1,2 +1,5 @@
+fastapi>=0.115
 requests>=2.31
 playwright>=1.40
+uvicorn>=0.30
+jsonschema>=4.20

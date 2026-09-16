@@ -7,6 +7,9 @@ used to define locally, so downstream callers are unaffected.
 
 import base64
 import json
+import os
+import tempfile
+import time
 import sys
 from pathlib import Path
 
@@ -86,7 +89,10 @@ def load_token_cache(path_str: str) -> dict:
         return {}
 
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        cache = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(cache, dict):
+            raise TokenCacheCorruptError("Token cache must be a JSON object.")
+        return cache
     except json.JSONDecodeError as exc:
         raise TokenCacheCorruptError(f"Failed to parse token cache file: {path}") from exc
 
@@ -95,4 +101,34 @@ def write_token_cache(path_str: str, cache: dict) -> None:
     """Atomically write *cache* to the token cache JSON file."""
     path = Path(path_str)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(cache, ensure_ascii=True, indent=2), encoding="utf-8")
+    fd, name = tempfile.mkstemp(prefix=".token-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            os.fchmod(stream.fileno(), 0o600)
+            json.dump(cache, stream, ensure_ascii=True, indent=2)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(name, path)
+    finally:
+        if os.path.exists(name):
+            os.unlink(name)
+
+
+def refresh_cached_tokens(cache: dict) -> dict:
+    """Use the same refresh endpoint as the web app; never log token values."""
+    with requests.post(
+        "https://kingogpt.skku.edu/identity/token/refresh",
+        json={"accessToken": cache["access_token"], "refreshToken": cache["refresh_token"]},
+        timeout=(10, 20), allow_redirects=False,
+    ) as response:
+        if response.status_code != 200:
+            raise AuthenticationError(f"Token refresh failed: HTTP {response.status_code}")
+        payload = response.json()
+    if not isinstance(payload, dict) or not all(isinstance(payload.get(k), str) and payload[k]
+                                               for k in ("accessToken", "refreshToken")):
+        raise AuthenticationError("Token refresh response is missing tokens.")
+    claims = decode_jwt_payload(payload["accessToken"])
+    if claims.get("exp", 0) <= time.time() + 300:
+        raise AuthenticationError("Token refresh returned an expired token.")
+    return {**cache, "access_token": payload["accessToken"], "refresh_token": payload["refreshToken"],
+            "claims": claims, "expires_at": claims["exp"], "fetched_at": int(time.time())}

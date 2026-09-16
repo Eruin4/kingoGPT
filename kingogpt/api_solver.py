@@ -8,22 +8,26 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Callable
 
 import requests
 
 from kingogpt.exceptions import (
     AuthenticationError,
+    BackendError,
     KingoGPTError,
     TokenCacheCorruptError,
     TokenExpiredError,
     TokenMissingError,
 )
+from kingogpt.sse import iter_events, decode_event, document
 from kingogpt.shared import (
     configure_output,
     decode_jwt_payload,
     fetch_user_profile,
     load_token_cache,
     write_token_cache,
+    refresh_cached_tokens,
 )
 
 QUERY_URL = "https://kingogpt.skku.edu/v2/athena/chats/m1/queries"
@@ -171,6 +175,18 @@ def refresh_token_cache(args: argparse.Namespace) -> dict:
     if args.no_auto_refresh_token:
         raise RuntimeError("Automatic token refresh is disabled.")
 
+    try:
+        previous = load_token_cache(args.token_cache)
+    except TokenCacheCorruptError:
+        previous = {}
+    if previous.get("access_token") and previous.get("refresh_token"):
+        try:
+            refreshed = refresh_cached_tokens(previous)
+        except (AuthenticationError, ValueError, RuntimeError):
+            logger.info("Cached refresh unavailable; falling back to browser login.")
+        else:
+            write_token_cache(args.token_cache, refreshed)
+            return refreshed
     logger.info("Refreshing KingoGPT login token...")
     try:
         import kingogpt.token_capture
@@ -321,6 +337,8 @@ def build_payload(
 
 
 def parse_optional_int(value: object) -> int | None:
+    if isinstance(value, bool):
+        return None
     if isinstance(value, int):
         return value
     if isinstance(value, str) and value.strip():
@@ -332,9 +350,9 @@ def parse_optional_int(value: object) -> int | None:
 
 
 def extract_identifiers(event: dict) -> tuple[int | None, int | None]:
-    data = event.get("data") or {}
+    data = event.get("data") if isinstance(event.get("data"), dict) else {}
     documents = data.get("documents") or []
-    document = documents[0] if documents else {}
+    document = documents[0] if isinstance(documents, list) and documents and isinstance(documents[0], dict) else {}
 
     room_id = (
         parse_optional_int(document.get("chat_rooms_id"))
@@ -358,14 +376,9 @@ def extract_identifiers(event: dict) -> tuple[int | None, int | None]:
 
 
 def extract_stream_text(event: dict) -> str:
-    data = event.get("data") or {}
-    documents = data.get("documents") or []
-    if documents:
-        document = documents[0] or {}
-        replies = document.get("replies") or {}
-        text = replies.get("text")
-        if isinstance(text, str):
-            return text
+    replies = document(event).get("replies")
+    if isinstance(replies, dict) and isinstance(replies.get("text"), str):
+        return replies["text"]
 
     choices = event.get("choices") or []
     if choices:
@@ -432,6 +445,8 @@ def chat_via_api(
     instruction: str | None = None,
     chat_room_id: int | None = None,
     chat_thread_id: int | None = None,
+    on_chunk: Callable[[str], None] | None = None,
+    verbose: bool = True,
 ) -> tuple[str, int | None, int | None]:
     headers = {
         "Authorization": f"Bearer {token}",
@@ -452,8 +467,9 @@ def chat_via_api(
         chat_thread_id=chat_thread_id,
     )
 
-    print("[*] API response started:")
-    print("-" * 40)
+    if verbose:
+        print("[*] API response started:")
+        print("-" * 40)
     response = requests.post(
         QUERY_URL,
         headers=headers,
@@ -462,41 +478,55 @@ def chat_via_api(
         timeout=(10, args.request_timeout),
     )
 
-    try:
-        response.raise_for_status()
-    except requests.HTTPError as exc:
-        snippet = response.text[:500]
-        raise RuntimeError(f"API request failed: HTTP {response.status_code} {snippet}") from exc
-
-    full_text = ""
+    chunks = []
     resolved_room_id = chat_room_id
     resolved_thread_id = chat_thread_id
-    for line in response.iter_lines(decode_unicode=True):
-        if not line or not line.startswith("data:"):
-            continue
-
-        data_str = line[5:].strip()
-        if not data_str:
-            continue
-        if data_str == "[DONE]":
-            break
-
-        try:
-            event = json.loads(data_str)
-        except json.JSONDecodeError:
-            continue
-
-        event_room_id, event_thread_id = extract_identifiers(event)
-        resolved_room_id = resolved_room_id or event_room_id
-        resolved_thread_id = resolved_thread_id or event_thread_id
-
-        chunk = extract_stream_text(event)
-        if chunk:
-            print(chunk, end="", flush=True)
-            full_text += chunk
-
-    print("\n" + "-" * 40)
-    return full_text, resolved_room_id, resolved_thread_id
+    completed = False
+    total_chars = 0
+    try:
+        if response.status_code in (401, 403):
+            raise AuthenticationError(f"API request failed: HTTP {response.status_code}")
+        response.raise_for_status()
+        content_type = response.headers.get("Content-Type", "").lower()
+        if "text/event-stream" not in content_type:
+            raise BackendError("Expected text/event-stream from KingoGPT.")
+        # SSE is always UTF-8; requests otherwise guesses Latin-1 for text/*.
+        response.encoding = "utf-8"
+        for event_type, raw in iter_events(response.iter_lines(chunk_size=128, decode_unicode=True)):
+            if raw.strip() == "[DONE]":
+                completed = True
+                break
+            event = decode_event(event_type, raw)
+            doc = document(event)
+            event_room_id, event_thread_id = extract_identifiers(event)
+            resolved_room_id = event_room_id or resolved_room_id
+            resolved_thread_id = event_thread_id or resolved_thread_id
+            if doc.get("event") == "check":
+                continue
+            chunk = extract_stream_text(event)
+            if chunk:
+                total_chars += len(chunk)
+                if total_chars > 4_000_000:
+                    raise BackendError("Upstream response exceeds the size limit.")
+                chunks.append(chunk)
+                if verbose:
+                    print(chunk, end="", flush=True)
+                if on_chunk is not None:
+                    on_chunk(chunk)
+            if doc.get("is_sse_finished") is True:
+                if doc.get("finish_reason") in ("length", "content_filter"):
+                    raise BackendError("Upstream stopped before a complete answer: " + doc["finish_reason"])
+                completed = True
+                break
+        if not completed:
+            raise BackendError("Upstream stream ended before its completion event; partial answer discarded.")
+        if not chunks:
+            raise BackendError("Upstream completed without a text answer.")
+    finally:
+        response.close()
+    if verbose:
+        print("\n" + "-" * 40)
+    return "".join(chunks), resolved_room_id, resolved_thread_id
 
 
 def main() -> int:
