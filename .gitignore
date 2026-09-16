@@ -43,3 +43,11 @@ docs/*daily-plan*
 /docs/runtime-improvements-*
 /docs/site-analysis.md
 /docs/desktop-preserved-*/
+
+# Server-only probes with machine-specific paths or endpoints
+/scripts/discord_connection_probe.py
+/scripts/hermes_deployment_preflight.py
+/scripts/hermes_smoke_probe.py
+/scripts/icampus_schedule.py
+/scripts/kingogpt_service_probe.py
+/scripts/runtime_improvements_probe.py
